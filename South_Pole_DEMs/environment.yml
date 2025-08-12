@@ -1,0 +1,18 @@
+name: SouthPoleDEMs
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - gdal
+  - rasterio
+  - numpy
+  - pillow
+  - pyyaml
+  - scipy
+  # - usd-python
+  - openusd
+  - tifffile
+  - pip
+  - pip:
+    - noise
+    - mathutils

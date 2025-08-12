@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+.venv/
+.env
+.vscode/
+# Big/binary types
+*.blend*
+*.glb
+*.usd*
+*.tif*
+*.png
+*.npy
+# Big directories
+South_Pole_DEMs/assets/
+South_Pole_DEMs/dem_processed/
+South_Pole_DEMs/usd_patches/
+blender/
