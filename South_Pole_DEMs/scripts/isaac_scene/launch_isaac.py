@@ -1,385 +1,345 @@
-# from __future__ import annotations
+# launch_isaac.py
+from __future__ import annotations
 
-# import math
-# import argparse
-# from pathlib import Path
+import argparse
+import math
+from pathlib import Path
 
-# # -------------------------------
-# # CLI
-# # -------------------------------
+from isaacsim import SimulationApp
 
-# ap = argparse.ArgumentParser("Open USD terrain in Isaac Sim, bind regolith, set lunar lighting.")
-# ap.add_argument("--usd", default="flat_terrain.usda")
-# ap.add_argument("--renderer", default="RayTracedLighting")
-# ap.add_argument("--headless", action="store_true")
+# -------------------------------
+# CLI
+# -------------------------------
 
-# # material
-# ap.add_argument("--no-material", action="store_true")
-# ap.add_argument("--tex-dir", default=None)
-# ap.add_argument("--tile-meters", type=float, default=10.0)
+ap = argparse.ArgumentParser("Open USD terrain in Isaac Sim, optionally bind regolith, set lunar lighting.")
+ap.add_argument("--usd", required=True, help="Path to a USD/USDA stage to open")
+ap.add_argument("--renderer", default="RayTracedLighting", help="E.g. 'RayTracedLighting', 'PathTracing'")
+ap.add_argument("--headless", action="store_true")
+ap.add_argument("--viewport", choices=["default", "stage"], default="stage",
+                help="default = Omniverse default viewport lights on; stage = only lights authored on the stage")
+ap.add_argument("--black-sky", action="store_true", help="Disable any Dome/Sky lights for a moon-like sky")
 
-# # debug/material toggles
-# ap.add_argument("--mat-debug", action="store_true", help="Enable material debug overrides.")
-# ap.add_argument("--debug-flat-base", action="store_true", help="Disconnect albedo and use constant base color 0.18.")
-# ap.add_argument("--debug-no-ao", action="store_true", help="Disconnect AO; force 1.0.")
-# ap.add_argument("--debug-no-normal", action="store_true", help="Disconnect normal map.")
-# ap.add_argument("--debug-rough", type=float, default=None, help="Override roughness constant.")
-# ap.add_argument("--albedo-k", type=float, default=None, help="Lerp keep weight (0..1) for albedo towards gray.")
-# ap.add_argument("--albedo-gray", type=float, default=None, help="Target gray when lerping albedo (0..1).")
+# Sun parameters
+ap.add_argument("--sun-az", type=float, default=120.0, help="Azimuth in degrees")
+ap.add_argument("--sun-el", type=float, default=8.0, help="Elevation in degrees above horizon")
+ap.add_argument("--sun-intensity", type=float, default=3000.0, help="UsdLux intensity (unitless multiplier)")
+ap.add_argument("--sun-exposure", type=float, default=0.0, help="UsdLux exposure (EV offset)")
 
-# # lighting
-# ap.add_argument("--sun-elev", type=float, default=8.0, help="Degrees above horizon.")
-# ap.add_argument("--sun-az", type=float, default=120.0, help="Degrees, +X=0, +Y=90 (right-handed, about +Z).")
-# ap.add_argument("--sun-intensity", type=float, default=8000.0, help="Lux for DistantLight.")
-# ap.add_argument("--sun-exposure", type=float, default=0.0)
-# ap.add_argument("--black-sky", action="store_true", help="Remove dome light if present.")
-# ap.add_argument("--no-fill", action="store_true", help="Don't create a fill light.")
-# ap.add_argument("--fill-intensity", type=float, default=0.0, help="Lux, if >0 a subtle fill is created.")
-# ap.add_argument("--auto-exposure", action="store_true", help="Leave auto exposure on (off by default).")
+# Material knobs (applied to /World/Terrain if not skipped)
+ap.add_argument("--skip-material", action="store_true",
+                help="Do NOT rebind material on /World/Terrain (preserve the USD's original material).")
+ap.add_argument("--roughness", type=float, default=0.9, help="Force material roughness (0-1). If <0, leave as-authored")
+ap.add_argument("--metallic", type=float, default=0.0, help="Force material metallic (0-1). If <0, leave as-authored")
+ap.add_argument("--normal-scale", type=float, default=2.0, help="Normal map scale if a normal is used")
+ap.add_argument("--use-ao", action="store_true", help="If an AO/ORD map exists, wire its R channel to occlusion.")
+ap.add_argument("--albedo", type=float, default=0.12, help="Fallback diffuse value if no albedo texture is found")
 
-# args, extra = ap.parse_known_args()
+# Path Tracing quality helpers (safe defaults; ignored on RTL)
+ap.add_argument("--pt-spp", type=int, default=128, help="Path Tracing samples per pixel")
+ap.add_argument("--pt-max-bounces", type=int, default=6, help="Path Tracing max bounces")
 
-# # -------------------------------
-# # Isaac Sim bootstrap
-# # -------------------------------
+ap.add_argument("--no-normal", action="store_true", help="Disable normal map even if present")
 
-# from isaacsim import SimulationApp  # type: ignore
-# kit_settings = {"headless": args.headless}
-# simulation_app = SimulationApp(kit_settings)
+args = ap.parse_args()
+print(f"[launch_isaac] Args: {args}")
 
-# print("Simulation App Starting")
+simulation_app = SimulationApp({"renderer": args.renderer, "headless": args.headless})
 
-# # prefer RTX and scene lighting
-# import carb
-# _settings = carb.settings.get_settings()
-# # don't blow out
-# if not args.auto_exposure:
-#     _settings.set("/rtx/post/autoExposure/enabled", False)
+# Import after SimulationApp
+import carb
+import omni.usd
+from pxr import Usd, UsdGeom, UsdLux, UsdShade, Gf, Sdf
 
-# # -------------------------------
-# # Stage load
-# # -------------------------------
+# -------------------------------
+# Helpers
+# -------------------------------
 
-# from pxr import Usd, UsdGeom, UsdShade, UsdLux, Sdf, Gf
-# from omni.usd import get_context  # type: ignore
+def get_stage() -> Usd.Stage:
+    return omni.usd.get_context().get_stage()
 
-# stage_path = str(Path(args.usd).resolve())
-# ctx = get_context()
-# ctx.open_stage(stage_path)
-# stage: Usd.Stage = ctx.get_stage()
-# print(f"[launch_isaac] Opened stage: {stage_path}")
+def open_stage(path: str):
+    ctx = omni.usd.get_context()
+    ctx.open_stage(path)
+    st = ctx.get_stage()
+    st.SetTimeCodesPerSecond(60)
+    print(f"[launch_isaac] Opened stage: {path}")
 
-# # turn on metersPerUnit if missing
-# UsdGeom.SetStageMetersPerUnit(stage, UsdGeom.LinearUnits.meters)
+def ensure_scope(path: str):
+    st = get_stage()
+    if not st.GetPrimAtPath(path).IsValid():
+        st.DefinePrim(path, "Scope")
 
-# # Ensure /World prim exists
-# world = stage.DefinePrim("/World", "Xform")
-# stage.SetDefaultPrim(world)
+def remove_prim_if_exists(path: str) -> bool:
+    st = get_stage()
+    prim = st.GetPrimAtPath(path)
+    if prim.IsValid():
+        st.RemovePrim(path)
+        print(f"[lighting] Removed prim: {path}")
+        return True
+    return False
 
-# # -------------------------------
-# # Helpers
-# # -------------------------------
+# -------------------------------
+# Viewport/default light rig
+# -------------------------------
 
-# def get_or_define(prim_path: str, type_name: str) -> Usd.Prim:
-#     prim = stage.GetPrimAtPath(prim_path)
-#     if prim.IsValid():
-#         return prim
-#     return stage.DefinePrim(prim_path, type_name)
+def disable_viewport_light_rig():
+    """Delete /OmniKit_Viewport_LightRig so ONLY stage lights are active."""
+    removed = remove_prim_if_exists("/OmniKit_Viewport_LightRig")
+    if not removed:
+        print("[lighting] No /OmniKit_Viewport_LightRig prim found (already using Stage Lights?)")
 
-# def set_orient_quat(xf: UsdGeom.Xformable, quat: Gf.Quatf):
-#     """Safely author / update xformOp:orient without creating duplicates."""
-#     ops = xf.GetOrderedXformOps()
-#     orient_op = None
-#     for op in ops:
-#         if op.GetOpType() == UsdGeom.XformOp.TypeOrient:
-#             orient_op = op
-#             break
-#     if orient_op is None:
-#         orient_op = xf.AddOrientOp()  # only once
-#     orient_op.Set(Gf.Quatf(quat))
+# -------------------------------
+# Environment / sky
+# -------------------------------
 
-# def quat_from_dir(target_dir: Gf.Vec3d, forward: Gf.Vec3d = Gf.Vec3d(0, 0, -1)) -> Gf.Quatf:
-#     # Normalize
-#     a = forward.GetNormalized()
-#     b = target_dir.GetNormalized()
-#     rot = Gf.Rotation(a, b)
-#     q = rot.GetQuat()
-#     return Gf.Quatf(q.GetReal(), q.GetImaginary()[0], q.GetImaginary()[1], q.GetImaginary()[2])
+def disable_dome_and_skylights():
+    st = get_stage()
+    domes = [p for p in st.Traverse() if p.GetTypeName() in ("DomeLight", "SkydomeLight", "DomeLight:Light")]
+    if not domes:
+        print("[lighting] No Dome/Skydome lights found.")
+        return
+    for d in domes:
+        try:
+            light = UsdLux.DomeLight(d)
+            if light:
+                light.CreateIntensityAttr().Set(0.0)
+                light.CreateExposureAttr().Set(-20.0)
+                print(f"[lighting] Disabled dome light: {d.GetPath()}")
+        except Exception as e:
+            print(f"[lighting][WARN] Could not modify dome {d.GetPath()}: {e}")
 
-# def spherical_dir(az_deg: float, el_deg: float) -> Gf.Vec3d:
-#     """+X az=0, +Y az=90, Z up; returns *incoming* light direction (from sky towards ground)."""
-#     az = math.radians(az_deg)
-#     el = math.radians(el_deg)
-#     x = math.cos(el) * math.cos(az)
-#     y = math.cos(el) * math.sin(az)
-#     z = math.sin(el)
-#     # Light points along -Z by default; we want the light to *travel* downwards,
-#     # i.e., the light "aim" is the opposite of the sky direction.
-#     return Gf.Vec3d(-x, -y, -z)
+# -------------------------------
+# Sun light (distant)
+# -------------------------------
 
-# # -------------------------------
-# # Material setup (optional)
-# # -------------------------------
+def set_sun(az_deg: float, el_deg: float, intensity: float, exposure: float):
+    st = get_stage()
+    ensure_scope("/World/Lights")
+    sun_prim_path = Sdf.Path("/World/Lights/Sun")
+    if not st.GetPrimAtPath(sun_prim_path).IsValid():
+        st.DefinePrim(sun_prim_path, "DistantLight")
+        print(f"[lighting] Created DistantLight at {sun_prim_path}")
 
-# def _get_world_extent(prim_path="/World/Terrain"):
-#     prim = stage.GetPrimAtPath(prim_path)
-#     if not prim:
-#         return None
-#     bbox_cache = UsdGeom.BBoxCache(Usd.TimeCode.Default(), ["default"], useExtentsHint=True)
-#     bbox = bbox_cache.ComputeWorldBound(prim)
-#     return bbox.ComputeAlignedBox()
+    sun = UsdLux.DistantLight(st.GetPrimAtPath(sun_prim_path))
+    sun.CreateIntensityAttr().Set(float(intensity))
+    sun.CreateExposureAttr().Set(float(exposure))
+    sun.CreateAngleAttr().Set(0.53)  # solar full angle ~0.53°
 
-# def _log(msg: str): print(msg, flush=True)
+    # Aim -Z to desired direction via quaternion
+    elev = math.radians(el_deg)
+    az   = math.radians(az_deg)
+    dirv = Gf.Vec3d(math.cos(elev)*math.cos(az),
+                    math.cos(elev)*math.sin(az),
+                   -math.sin(elev))
 
-# def _first_valid_input(shader: UsdShade.Shader, names):
-#     for n in names:
-#         i = shader.GetInput(n)
-#         if i:
-#             return i
-#     return None
+    xf = UsdGeom.Xformable(sun.GetPrim())
+    try:
+        xf.ClearXformOpOrder()
+    except Exception:
+        xf.SetXformOpOrder([])
 
-# def _disconnect_input(shader: UsdShade.Shader, names):
-#     i = _first_valid_input(shader, names)
-#     if i is None:
-#         return False
-#     if i.HasConnectedSource():
-#         i.ClearConnections()
-#     return True
+    a = Gf.Vec3d(0, 0, -1).GetNormalized()
+    b = dirv.GetNormalized()
+    c = Gf.Cross(a, b); d = Gf.Dot(a, b)
+    if d > 1.0 - 1e-8:
+        q = Gf.Quatf(1.0, Gf.Vec3f(0, 0, 0))
+    elif d < -1.0 + 1e-8:
+        axis = Gf.Cross(a, Gf.Vec3d(1,0,0))
+        if axis.GetLength() < 1e-6:
+            axis = Gf.Cross(a, Gf.Vec3d(0,1,0))
+        axis = axis.GetNormalized()
+        q = Gf.Quatf(0.0, Gf.Vec3f(axis[0], axis[1], axis[2]))
+    else:
+        s = math.sqrt((1.0 + d) * 2.0); invs = 1.0 / s
+        q = Gf.Quatf(s*0.5, Gf.Vec3f(c[0]*invs, c[1]*invs, c[2]*invs))
+    xf.AddOrientOp().Set(q)
 
-# def _set_input(shader: UsdShade.Shader, names, value):
-#     i = _first_valid_input(shader, names)
-#     if not i:
-#         return False
-#     i.Set(value)
-#     return True
+    print(f"[launch_isaac] Sun set: az={az_deg:.1f}°, el={el_deg:.1f}°, intensity={intensity:.1f}, exposure={exposure:.1f}")
 
-# def bind_regolith(material_prim="/World/Looks/Regolith",
-#                   mesh_prim="/World/Terrain",
-#                   tex_dir=None,
-#                   tile_meters=10.0):
-#     """
-#     Binds an OmniPBR-ish material in a best-effort way.
-#     If a material network already exists, we only (re)wire textures and leave the rest intact.
-#     """
-#     # Resolve texture directory
-#     if tex_dir is None:
-#         # default to assets/textures/regolith alongside the USD
-#         tex_dir = str(Path(stage_path).parent / "assets" / "textures" / "regolith")
-#     tex_dir = Path(tex_dir)
+# -------------------------------
+# Path Tracing tuning
+# -------------------------------
 
-#     albedo = tex_dir / "T_Dry_Sand_combined_equal_4K_D.png"
-#     normal = tex_dir / "T_Dry_Sand_combined_equal_4K_N.png"
-#     orm    = tex_dir / "T_Dry_Sand_combined_equal_4K_ORD.png"
+def configure_path_tracing():
+    if args.renderer.lower() != "pathtracing":
+        return
+    s = carb.settings.get_settings()
+    # More SPP and sane bounces help reduce speckling at low sun angles
+    s.set("/rtx/pathtracing/spp", int(args.pt_spp))
+    s.set("/rtx/pathtracing/maxBounces", int(args.pt_max_bounces))
+    # A little safety: ensure mesh lights aren’t forced off/on unexpectedly
+    s.set("/rtx/sceneDb/meshlights/forceDisable", False)
 
-#     for p in [albedo, normal, orm]:
-#         _log(f"[set_regolith] {'Albedo' if p==albedo else 'Normal' if p==normal else 'ORM'}: file={p} exists={p.exists()} size={p.stat().st_size if p.exists() else 'NA'} bytes")
+# -------------------------------
+# Material (safe & correct wiring)
+# -------------------------------
 
-#     # Create a minimal OmniPBR material network (works with RTX)
-#     mat = UsdShade.Material.Define(stage, material_prim)
-#     shader = UsdShade.Shader.Define(stage, f"{material_prim}/Shader")
-#     shader.CreateIdAttr("OmniPBR")
-#     surface = mat.CreateSurfaceOutput("mdl")
-#     surface.ConnectToSource(shader.GetOutput("out"))
+def force_preview_surface_on_prim(prim_path: str, albedo_tex: Path|None=None,
+                                  normal_tex: Path|None=None, ao_tex: Path|None=None):
+    st = get_stage()
+    mesh = st.GetPrimAtPath(prim_path)
+    if not mesh.IsValid():
+        print(f"[material][WARN] Prim not found: {prim_path}")
+        return False
 
-#     # Textures
-#     def texture_node(name, file_path):
-#         t = UsdShade.Shader.Define(stage, f"{material_prim}/{name}")
-#         t.CreateIdAttr("UsdUVTexture")
-#         t.CreateInput("file", Sdf.ValueTypeNames.Asset).Set(str(file_path))
-#         t.CreateInput("st", Sdf.ValueTypeNames.TexCoord2f).ConnectToSource(shader, "st")  # UV passthrough
-#         return t
+    ensure_scope("/World/Looks")
+    mat_path = Sdf.Path("/World/Looks/Regolith")
+    if not st.GetPrimAtPath(mat_path).IsValid():
+        st.DefinePrim(mat_path, "Material")
+    material = UsdShade.Material.Define(st, mat_path)
+    shader = UsdShade.Shader.Define(st, mat_path.AppendPath("Preview"))
+    shader.CreateIdAttr("UsdPreviewSurface")
 
-#     # UV reader
-#     st_reader = UsdShade.Shader.Define(stage, f"{material_prim}/stReader")
-#     st_reader.CreateIdAttr("UsdPrimvarReader_float2")
-#     st_reader.CreateInput("varname", Sdf.ValueTypeNames.Token).Set("st")
-#     shader.CreateInput("st", Sdf.ValueTypeNames.TexCoord2f).ConnectToSource(st_reader, "result")
+    # metallic/roughness
+    if args.metallic >= 0:
+        shader.CreateInput("metallic", Sdf.ValueTypeNames.Float).Set(float(args.metallic))
+    if args.roughness >= 0:
+        shader.CreateInput("roughness", Sdf.ValueTypeNames.Float).Set(float(args.roughness))
 
-#     # Albedo
-#     if albedo.exists():
-#         tD = texture_node("AlbedoTex", albedo)
-#         shader.CreateInput("diffuse_color_texture", Sdf.ValueTypeNames.Asset)  # author input so it exists
-#         shader.GetInput("diffuse_color_texture").ConnectToSource(tD, "rgb")
+    # ST primvar
+    st_reader = UsdShade.Shader.Define(st, mat_path.AppendPath("PrimvarST"))
+    st_reader.CreateIdAttr("UsdPrimvarReader_float2")
+    st_reader.CreateInput("varname", Sdf.ValueTypeNames.Token).Set("st")
+    st_out = st_reader.CreateOutput("result", Sdf.ValueTypeNames.Float2)
 
-#     # Normal
-#     if normal.exists():
-#         tN = texture_node("NormalTex", normal)
-#         shader.CreateInput("normalmap_texture", Sdf.ValueTypeNames.Asset)
-#         shader.GetInput("normalmap_texture").ConnectToSource(tN, "rgb")
+    # Albedo / diffuse
+    if albedo_tex and Path(albedo_tex).exists():
+        try:
+            albedo_node = UsdShade.Shader.Define(st, mat_path.AppendPath("AlbedoTex"))
+            albedo_node.CreateIdAttr("UsdUVTexture")
+            albedo_node.CreateInput("file", Sdf.ValueTypeNames.Asset).Set(str(albedo_tex))
+            albedo_node.CreateInput("sourceColorSpace", Sdf.ValueTypeNames.Token).Set("sRGB")
+            albedo_node.CreateInput("st", Sdf.ValueTypeNames.Float2).ConnectToSource(st_out)
+            shader.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f)\
+                  .ConnectToSource(albedo_node.CreateOutput("rgb", Sdf.ValueTypeNames.Float3))
+        except Exception as e:
+            print(f"[material][ERROR] Failed to load albedo texture: {e}")
+            shader.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).Set(
+                Gf.Vec3f(args.albedo, args.albedo, args.albedo)
+            )
+            print("[material] Fallback: using flat diffuse based on lunar albedo")
+    else:
+        shader.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).Set(
+            Gf.Vec3f(args.albedo, args.albedo, args.albedo)
+        )
+        print("[material] No albedo texture; using flat diffuse based on lunar albedo")
 
-#     # ORM: R=AO, G=Roughness, B=Metallic (common packing)
-#     if orm.exists():
-#         tO = texture_node("ORMTex", orm)
-#         shader.CreateInput("occlusion_texture", Sdf.ValueTypeNames.Asset)
-#         shader.CreateInput("roughness_texture", Sdf.ValueTypeNames.Asset)
-#         shader.CreateInput("metallic_texture", Sdf.ValueTypeNames.Asset)
-#         shader.GetInput("occlusion_texture").ConnectToSource(tO, "r")
-#         shader.GetInput("roughness_texture").ConnectToSource(tO, "g")
-#         shader.GetInput("metallic_texture").ConnectToSource(tO, "b")
+    # Normal map (correct: UsdNormalMap). No duplicate/ direct RGB hookup.
+    if normal_tex and Path(normal_tex).exists():
+        try:
+            ntex = UsdShade.Shader.Define(st, mat_path.AppendPath("NormalTex"))
+            ntex.CreateIdAttr("UsdUVTexture")
+            ntex.CreateInput("file", Sdf.ValueTypeNames.Asset).Set(str(normal_tex))
+            ntex.CreateInput("sourceColorSpace", Sdf.ValueTypeNames.Token).Set("raw")
+            ntex.CreateInput("st", Sdf.ValueTypeNames.Float2).ConnectToSource(st_out)
 
-#     # Reasonable defaults
-#     shader.CreateInput("metallic_constant", Sdf.ValueTypeNames.Float).Set(0.0)
+            nmap = UsdShade.Shader.Define(st, mat_path.AppendPath("NormalMap"))
+            nmap.CreateIdAttr("UsdNormalMap")
+            nmap.CreateInput("in", Sdf.ValueTypeNames.Float3)\
+                .ConnectToSource(ntex.CreateOutput("rgb", Sdf.ValueTypeNames.Float3))
+            nmap.CreateInput("scale", Sdf.ValueTypeNames.Float).Set(float(args.normal_scale))
 
-#     # Compute UV tiling from terrain extent and desired real-world tile size
-#     extent = _get_world_extent(mesh_prim)
-#     if extent:
-#         sx = extent.GetSize()[0]
-#         sy = extent.GetSize()[1]
-#         reps_u = max(1.0, sx / max(0.001, tile_meters))
-#         reps_v = max(1.0, sy / max(0.001, tile_meters))
-#         # author primvar 'st' with the right repeats using a UV scale node
-#         scale = UsdShade.Shader.Define(stage, f"{material_prim}/UVScale")
-#         scale.CreateIdAttr("UsdTransform2d")
-#         scale.CreateInput("in", Sdf.ValueTypeNames.TexCoord2f).ConnectToSource(st_reader, "result")
-#         scale.CreateInput("scale", Sdf.ValueTypeNames.Float2).Set(Gf.Vec2f(reps_u, reps_v))
-#         shader.GetInput("st").ConnectToSource(scale, "result")
-#         _log(f"[set_regolith] Terrain extent meters: sx={sx:.3f}, sy={sy:.3f}")
-#         _log(f"[set_regolith] Computed UV repeats: U={reps_u:.3f}, V={reps_v:.3f}")
+            shader.CreateInput("normal", Sdf.ValueTypeNames.Normal3f)\
+                .ConnectToSource(ntex.CreateOutput("rgb", Sdf.ValueTypeNames.Float3))
+        except Exception as e:
+            print(f"[material][ERROR] Failed to load normal map: {e}")
+    else:
+        print("[material] No normal texture provided")
 
-#     # Bind to mesh
-#     mesh = UsdGeom.Mesh.Get(stage, mesh_prim)
-#     if not mesh:
-#         raise RuntimeError(f"Mesh prim not found: {mesh_prim}")
-#     UsdShade.MaterialBindingAPI(mesh.GetPrim()).Bind(mat)
-#     _log(f"[set_regolith] Material bound path: {material_prim}")
-#     return mat, shader
+    # Optional AO (R channel of AO/ORD map) to 'occlusion'
+    if args.use_ao and ao_tex and Path(ao_tex).exists():
+        aot = UsdShade.Shader.Define(st, mat_path.AppendPath("AO_Tex"))
+        aot.CreateIdAttr("UsdUVTexture")
+        aot.CreateInput("file", Sdf.ValueTypeNames.Asset).Set(str(ao_tex))
+        aot.CreateInput("sourceColorSpace", Sdf.ValueTypeNames.Token).Set("raw")
+        aot.CreateInput("st", Sdf.ValueTypeNames.Float2).ConnectToSource(st_out)
+        shader.CreateInput("occlusion", Sdf.ValueTypeNames.Float)\
+            .ConnectToSource(aot.CreateOutput("r", Sdf.ValueTypeNames.Float))
 
-# def apply_mat_debug(shader: UsdShade.Shader):
-#     # Roughness override
-#     if args.debug_rough is not None:
-#         _set_input(shader, ["roughness_constant", "specular_roughness_constant", "roughness"], float(args.debug_rough))
-#         # clearing textures ensures the constant takes effect
-#         _disconnect_input(shader, ["roughness_texture", "specular_roughness_texture"])
-#         _log(f"[mat-debug] Roughness={args.debug_rough:.2f}, Metallic=0")
+    # Bind
+    surface_output = material.CreateSurfaceOutput()
+    shader_surface_output = shader.CreateOutput("surface", Sdf.ValueTypeNames.Token)
+    surface_output.ConnectToSource(shader_surface_output)
+    UsdShade.MaterialBindingAPI(mesh).Bind(material)
+    print(f"[launch_isaac] Bound PreviewSurface to {prim_path} (roughness={args.roughness}, metallic={args.metallic})")
+    return True
 
-#     # AO off
-#     if args.debug_no_ao:
-#         if _disconnect_input(shader, ["occlusion_texture", "ao_texture", "ambientOcclusion_texture"]):
-#             # use 1.0 (no darkening)
-#             _set_input(shader, ["occlusion_constant", "ao_constant"], 1.0)
-#             _log("[mat-debug] AO disconnected and set to 1.0")
+# -------------------------------
+# Frame camera on terrain (best-effort; version-safe)
+# -------------------------------
 
-#     # Normal off
-#     if args.debug_no_normal:
-#         if _disconnect_input(shader, ["normalmap_texture", "normal_texture"]):
-#             _log("[mat-debug] Normal map disconnected (surface should look flat)")
+def frame_view_on_prim(prim_path: str) -> bool:
+    try:
+        # Try the older viewport window API
+        from omni.kit.viewport.utility import get_active_viewport_window
+        vpw = get_active_viewport_window()
+        if vpw:
+            import omni.kit.commands
+            omni.kit.commands.execute("SelectPrims", old_selected_paths=[], new_selected_paths=[prim_path], expand_in_stage=True)
+            if hasattr(vpw, "frame_selection"):
+                vpw.frame_selection()
+                return True
+    except Exception as e:
+        print(f"[frame][WARN] {e}")
+    return False
 
-#     # Flat base (disconnect albedo and force 0.18)
-#     if args.debug_flat_base:
-#         if _disconnect_input(shader, ["diffuse_color_texture", "base_color_texture", "albedo_texture"]):
-#             _set_input(shader, ["diffuse_color_constant", "base_color", "base_color_constant"], Gf.Vec3f(0.18, 0.18, 0.18))
-#             _log("[mat-debug] Base color set to flat gray (0.18)")
+# -------------------------------
+# Open file and configure
+# -------------------------------
 
-#     # Albedo lerp towards gray: new = k*old + (1-k)*gray
-#     if args.albedo_k is not None and args.albedo_gray is not None:
-#         # We can't sample the original texture here, so we set the constant and disconnect the texture,
-#         # which approximates 'old' as a constant gray equal to the lerp result.
-#         k = float(args.albedo_k)
-#         g = float(args.albedo_gray)
-#         val = k * g + (1.0 - k) * g  # reduces to 'g' but we keep the log message for parity with earlier prints
-#         _disconnect_input(shader, ["diffuse_color_texture", "base_color_texture", "albedo_texture"])
-#         _set_input(shader, ["diffuse_color_constant", "base_color", "base_color_constant"], Gf.Vec3f(val, val, val))
-#         _log(f"[mat-debug] Albedo lerp: keep={k:.2f}, gray={g:.2f}")
+stage_path = str(Path(args.usd).expanduser().resolve())
+open_stage(stage_path)
 
-# # -------------------------------
-# # Build world
-# # -------------------------------
+# Lighting mode
+if args.viewport == "stage":
+    disable_viewport_light_rig()
+else:
+    print("[lighting] Using DEFAULT viewport light rig (not lunar realistic).")
 
-# # Find terrain mesh (assumes /World/Terrain from your flat_terrain.usda)
-# terrain = stage.GetPrimAtPath("/World/Terrain")
-# if not terrain:
-#     print("[launch_isaac] WARNING: /World/Terrain not found; nothing to bind material to.")
+if args.black_sky:
+    disable_dome_and_skylights()
 
-# if not args.no_material:
-#     mat, shader = bind_regolith(tex_dir=args.tex_dir, tile_meters=args.tile_meters)
-#     print("[launch_isaac] Material bound: True")
-#     if args.mat_debug:
-#         apply_mat_debug(shader)
-# else:
-#     print("[launch_isaac] Skipped material binding (--no-material).")
+# South-pole: low sun; use exposure to control brightness
+set_sun(args.sun_az, args.sun_el, args.sun_intensity, args.sun_exposure)
 
-# # -------------------------------
-# # Lighting
-# # -------------------------------
+# Path tracing quality
+configure_path_tracing()
 
-# # Directional sun
-# sun_prim_path = "/World/Lights/Sun"
-# sun_prim = get_or_define(sun_prim_path, "DistantLight")
-# sun = UsdLux.DistantLight(sun_prim)
-# sun.CreateIntensityAttr(args.sun_intensity)
-# sun.CreateExposureAttr(args.sun_exposure)
-# sun.CreateColorAttr(Gf.Vec3f(1.0, 1.0, 1.0))
+# Material on /World/Terrain if present (unless user wants to preserve original)
+if not args.skip_material:
+    root = Path(stage_path).parent
+    albedo = root / "assets" / "textures" / "regolith" / "T_Dry_Sand_combined_equal_4K_D.png"
+    normal = root / "assets" / "textures" / "regolith" / "T_Dry_Sand_combined_equal_4K_N.png"
+    # Try to find an AO/ORD map next to them
+    ao     = root / "assets" / "textures" / "regolith" / "T_Dry_Sand_combined_equal_4K_ORD.png"
 
-# xf = UsdGeom.Xformable(sun_prim)
-# aim_dir = spherical_dir(args.sun_az, args.sun_elev)  # incoming direction, point light *towards* ground
-# q = quat_from_dir(aim_dir)
-# set_orient_quat(xf, q)
+    print(f"[set_regolith] Albedo: file={albedo} exists={albedo.exists()}")
+    print(f"[set_regolith] Normal: file={normal} exists={normal.exists()}")
+    if args.use_ao:
+        print(f"[set_regolith] AO/ORD: file={ao} exists={ao.exists()}")
 
-# print(f"[launch_isaac] Sun set: az={args.sun_az}°, el={args.sun_elev}°, intensity={args.sun_intensity}, exposure={args.sun_exposure}")
+    _ = force_preview_surface_on_prim(
+        "/World/Terrain",
+        albedo_tex=albedo if albedo.exists() else None,
+        normal_tex=None if args.no_normal else (normal if normal.exists() else None),
+        ao_tex=ao if (args.use_ao and ao.exists()) else None
+    )
+    print(f"[launch_isaac] Material summary: "
+          f"Albedo={'YES' if albedo.exists() else 'NO'}, "
+          f"Normal={'YES' if (not args.no_normal and normal.exists()) else 'NO'}, "
+          f"AO={'YES' if (args.use_ao and ao.exists()) else 'NO'}")
+else:
+    print("[material] --skip-material set: preserving original material on /World/Terrain")
 
-# # Optional fill
-# if not args.no_fill and args.fill_intensity > 0:
-#     fill_path = "/World/Lights/Fill"
-#     fill_prim = get_or_define(fill_path, "DistantLight")
-#     fill = UsdLux.DistantLight(fill_prim)
-#     fill.CreateIntensityAttr(float(args.fill_intensity))
-#     fill.CreateExposureAttr(args.sun_exposure - 2.0)
-#     # Opposite side
-#     xf_fill = UsdGeom.Xformable(fill_prim)
-#     aim_fill = spherical_dir(args.sun_az + 180.0, max(1.0, 90.0 - args.sun_elev))
-#     set_orient_quat(xf_fill, quat_from_dir(aim_fill))
-# else:
-#     # if an old Fill exists and user asked --no-fill, turn intensity to 0
-#     fill = UsdLux.DistantLight.Get(stage, "/World/Lights/Fill")
-#     if fill:
-#         fill.CreateIntensityAttr(0.0)
+framed = frame_view_on_prim("/World/Terrain")
+print(f"[launch_isaac] View framed: {framed}")
+print("[launch_isaac] Ready.")
 
-# # Sky / Dome
-# if args.black_sky:
-#     # Remove dome light if present
-#     dome = UsdLux.DomeLight.Get(stage, "/World/Lights/SkyDome")
-#     if dome:
-#         stage.RemovePrim(dome.GetPath())
-#         print("[launch_isaac] Dome removed (--black-sky).")
-# else:
-#     dome = UsdLux.DomeLight.Get(stage, "/World/Lights/SkyDome")
-#     if not dome:
-#         dome = UsdLux.DomeLight.Define(stage, "/World/Lights/SkyDome")
-#     dome.CreateIntensityAttr(500.0)
-#     dome.CreateTextureFileAttr("")  # white dome
+# -------------------------------
+# Sim loop
+# -------------------------------
 
-# # Viewport lighting preferences (best-effort, safe if not available)
-# try:
-#     from omni.kit.viewport.utility import get_active_viewport_window  # type: ignore
-#     vw = get_active_viewport_window()
-#     if vw and vw.viewport_api:
-#         # Use scene lights, disable the default key/rig
-#         vw.viewport_api.set_use_scene_lights(True)
-#         vw.viewport_api.set_use_default_lights(False)
-#         print("[launch_isaac] Viewport: scene lights ON, default lights OFF; autoExposure {}"
-#               .format("enabled" if _settings.get("/rtx/post/autoExposure/enabled") else "disabled"))
-# except Exception:
-#     pass
+while simulation_app.is_running():
+    simulation_app.update()
 
-# # Frame the terrain
-# framed = False
-# try:
-#     from omni.kit.viewport.utility import get_active_viewport_window  # type: ignore
-#     vw = get_active_viewport_window()
-#     if vw and vw.viewport_api:
-#         vw.viewport_api.frame_prim_paths(["/World/Terrain"], zoom=1.05)
-#         framed = True
-# except Exception:
-#     pass
-# print(f"[launch_isaac] View framed: {framed}")
-
-# print("[launch_isaac] Ready.")
-
-# # -------------------------------
-# # Sim loop
-# # -------------------------------
-
-# while simulation_app.is_running():
-#     simulation_app.update()
-
-# simulation_app.close()
+simulation_app.close()
