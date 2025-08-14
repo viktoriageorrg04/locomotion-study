@@ -18,6 +18,7 @@ ap.add_argument("--headless", action="store_true")
 ap.add_argument("--viewport", choices=["default", "stage"], default="stage",
                 help="default = Omniverse default viewport lights on; stage = only lights authored on the stage")
 ap.add_argument("--black-sky", action="store_true", help="Disable any Dome/Sky lights for a moon-like sky")
+# ap.add_argument("--inspect-omnigraph", action="store_true", help="Print Omnigraph nodes after stage setup")
 
 # Sun parameters
 ap.add_argument("--sun-az", type=float, default=120.0, help="Azimuth in degrees")
@@ -25,20 +26,27 @@ ap.add_argument("--sun-el", type=float, default=8.0, help="Elevation in degrees 
 ap.add_argument("--sun-intensity", type=float, default=3000.0, help="UsdLux intensity (unitless multiplier)")
 ap.add_argument("--sun-exposure", type=float, default=0.0, help="UsdLux exposure (EV offset)")
 
+ap.add_argument("--fill-ratio", type=float, default=0.0,
+                help="0..1 fraction of sun intensity used for a dim ambient fill (0 = off)")
+
 # Material knobs (applied to /World/Terrain if not skipped)
 ap.add_argument("--skip-material", action="store_true",
                 help="Do NOT rebind material on /World/Terrain (preserve the USD's original material).")
-ap.add_argument("--roughness", type=float, default=0.9, help="Force material roughness (0-1). If <0, leave as-authored")
-ap.add_argument("--metallic", type=float, default=0.0, help="Force material metallic (0-1). If <0, leave as-authored")
-ap.add_argument("--normal-scale", type=float, default=2.0, help="Normal map scale if a normal is used")
-ap.add_argument("--use-ao", action="store_true", help="If an AO/ORD map exists, wire its R channel to occlusion.")
-ap.add_argument("--albedo", type=float, default=0.12, help="Fallback diffuse value if no albedo texture is found")
 
 # Path Tracing quality helpers (safe defaults; ignored on RTL)
 ap.add_argument("--pt-spp", type=int, default=128, help="Path Tracing samples per pixel")
 ap.add_argument("--pt-max-bounces", type=int, default=6, help="Path Tracing max bounces")
 
-ap.add_argument("--no-normal", action="store_true", help="Disable normal map even if present")
+# Spawn assets
+ap.add_argument("--asset-usd", default="", help="Path to any robot/asset USD to spawn")
+ap.add_argument("--asset-name", default="asset", help="Name under /World")
+ap.add_argument("--asset-x", type=float, default=0.0)
+ap.add_argument("--asset-y", type=float, default=0.0)
+ap.add_argument("--asset-yaw", type=float, default=0.0)
+ap.add_argument("--drop-margin", type=float, default=0.05, help="Meters to drop above terrain")
+ap.add_argument("--moon", action="store_true", help="Use 1.62 m/s^2 gravity (lunar)")
+ap.add_argument("--asset-center", action="store_true",
+                help="Place asset at the center of /World/Terrain")
 
 args = ap.parse_args()
 print(f"[launch_isaac] Args: {args}")
@@ -48,7 +56,7 @@ simulation_app = SimulationApp({"renderer": args.renderer, "headless": args.head
 # Import after SimulationApp
 import carb
 import omni.usd
-from pxr import Usd, UsdGeom, UsdLux, UsdShade, Gf, Sdf
+from pxr import Usd, UsdGeom, UsdLux, Gf, Sdf
 
 # -------------------------------
 # Helpers
@@ -89,6 +97,66 @@ def disable_viewport_light_rig():
         print("[lighting] No /OmniKit_Viewport_LightRig prim found (already using Stage Lights?)")
 
 # -------------------------------
+# Renderer settings
+# -------------------------------
+
+def configure_renderer_settings(args):
+    s = carb.settings.get_settings()
+    if args.renderer.lower() == "pathtracing":
+        s.set("/rtx/pathtracing/spp", int(args.pt_spp))
+        s.set("/rtx/pathtracing/maxBounces", int(args.pt_max_bounces))
+        s.set("/rtx/pathtracing/clampSpp", 0)  # stop the default 64-SPP clamp
+
+        s.set("/rtx/pathtracing/accumulation/enable", True)
+        s.set("/rtx/pathtracing/accumulation/maxFrames", 512)
+        s.set("/rtx/pathtracing/accumulation/resetOnCameraCut", True)
+
+        s.set("/rtx/pathtracing/denoiser/enable", True)
+        s.set("/rtx/pathtracing/denoiser/inputType", "float4")
+        s.set("/rtx/pathtracing/denoiser/blendFactor", 0.2)
+
+        s.set("/rtx/pathtracing/fireflyFilter/enable", True)
+        s.set("/rtx/pathtracing/fireflyFilter/threshold", 10.0)
+
+        s.set("/rtx/pathtracing/colorClamp/enable", True)
+        s.set("/rtx/pathtracing/colorClamp/value", 10.0)
+
+        s.set("/rtx/pathtracing/samplingFilter", "BlackmanHarris")
+
+    elif args.renderer.lower() == "raytracedlighting":
+        s.set("/rtx/raytracing/spp", 32)
+        s.set("/rtx/raytracing/maxBounces", 6)
+
+        s.set("/rtx/raytracing/accumulation/enable", True)
+        s.set("/rtx/raytracing/accumulation/maxFrames", 64)
+        s.set("/rtx/raytracing/accumulation/resetOnCameraCut", True)
+
+        s.set("/rtx/raytracing/denoiser/enable", True)
+        s.set("/rtx/raytracing/denoiser/inputType", "float4")
+        s.set("/rtx/raytracing/denoiser/blendFactor", 0.2)
+
+        s.set("/rtx/raytracing/fireflyFilter/enable", True)
+        s.set("/rtx/raytracing/fireflyFilter/threshold", 10.0)
+
+        s.set("/rtx/raytracing/colorClamp/enable", True)
+        s.set("/rtx/raytracing/colorClamp/value", 10.0)
+
+        s.set("/rtx/raytracing/samplingFilter", "BlackmanHarris")
+
+        s.set("/rtx/sceneDb/meshlights/forceDisable", False)
+
+        # Keep tonemapper on, but stop it from “helping”
+        for k, v in [
+            ("/rtx/post/tonemapper/enable", True),
+            ("/rtx/post/tonemapper/enableAutoExposure", False),  # 4.5 name
+            ("/rtx/post/tonemapper/autoExposure", False),        # older name; harmless if unknown
+            ("/rtx/post/tonemapper/localExposure/enable", False),
+            ("/rtx/post/tonemapper/exposureCompensation", -1.5),
+        ]:
+            try: s.set(k, v)
+            except Exception: pass
+
+# -------------------------------
 # Environment / sky
 # -------------------------------
 
@@ -109,6 +177,28 @@ def disable_dome_and_skylights():
             print(f"[lighting][WARN] Could not modify dome {d.GetPath()}: {e}")
 
 # -------------------------------
+# Fake ambient light
+# -------------------------------
+
+def add_fill_light(fill_ratio: float, base_intensity: float):
+    """Create a very dim dome fill to fake ground bounce."""
+    if fill_ratio <= 0.0:
+        return
+    st = get_stage()
+    ensure_scope("/World/Lights")
+    fill = UsdLux.DomeLight.Define(st, Sdf.Path("/World/Lights/Fill"))
+    # Use a minimum intensity if base_intensity is zero
+    intensity = float(base_intensity) * float(fill_ratio)
+    if intensity == 0.0:
+        intensity = 50000.0 * float(fill_ratio)  # fallback value
+    fill.CreateIntensityAttr().Set(intensity)
+    fill.CreateExposureAttr().Set(0.0)
+    fill.CreateColorAttr().Set(Gf.Vec3f(1.0, 1.0, 1.0))
+    fill.CreateTextureFileAttr().Clear()
+    fill.CreateNormalizeAttr().Set(True)
+    print(f"[lighting] Fill dome added: ratio={fill_ratio:.4f}, intensity≈{intensity:.2f}")
+
+# -------------------------------
 # Sun light (distant)
 # -------------------------------
 
@@ -121,7 +211,9 @@ def set_sun(az_deg: float, el_deg: float, intensity: float, exposure: float):
         print(f"[lighting] Created DistantLight at {sun_prim_path}")
 
     sun = UsdLux.DistantLight(st.GetPrimAtPath(sun_prim_path))
+
     sun.CreateIntensityAttr().Set(float(intensity))
+    # sun.CreateExposureAttr().Set(0.0)
     sun.CreateExposureAttr().Set(float(exposure))
     sun.CreateAngleAttr().Set(0.53)  # solar full angle ~0.53°
 
@@ -157,114 +249,6 @@ def set_sun(az_deg: float, el_deg: float, intensity: float, exposure: float):
     print(f"[launch_isaac] Sun set: az={az_deg:.1f}°, el={el_deg:.1f}°, intensity={intensity:.1f}, exposure={exposure:.1f}")
 
 # -------------------------------
-# Path Tracing tuning
-# -------------------------------
-
-def configure_path_tracing():
-    if args.renderer.lower() != "pathtracing":
-        return
-    s = carb.settings.get_settings()
-    # More SPP and sane bounces help reduce speckling at low sun angles
-    s.set("/rtx/pathtracing/spp", int(args.pt_spp))
-    s.set("/rtx/pathtracing/maxBounces", int(args.pt_max_bounces))
-    # A little safety: ensure mesh lights aren’t forced off/on unexpectedly
-    s.set("/rtx/sceneDb/meshlights/forceDisable", False)
-
-# -------------------------------
-# Material (safe & correct wiring)
-# -------------------------------
-
-def force_preview_surface_on_prim(prim_path: str, albedo_tex: Path|None=None,
-                                  normal_tex: Path|None=None, ao_tex: Path|None=None):
-    st = get_stage()
-    mesh = st.GetPrimAtPath(prim_path)
-    if not mesh.IsValid():
-        print(f"[material][WARN] Prim not found: {prim_path}")
-        return False
-
-    ensure_scope("/World/Looks")
-    mat_path = Sdf.Path("/World/Looks/Regolith")
-    if not st.GetPrimAtPath(mat_path).IsValid():
-        st.DefinePrim(mat_path, "Material")
-    material = UsdShade.Material.Define(st, mat_path)
-    shader = UsdShade.Shader.Define(st, mat_path.AppendPath("Preview"))
-    shader.CreateIdAttr("UsdPreviewSurface")
-
-    # metallic/roughness
-    if args.metallic >= 0:
-        shader.CreateInput("metallic", Sdf.ValueTypeNames.Float).Set(float(args.metallic))
-    if args.roughness >= 0:
-        shader.CreateInput("roughness", Sdf.ValueTypeNames.Float).Set(float(args.roughness))
-
-    # ST primvar
-    st_reader = UsdShade.Shader.Define(st, mat_path.AppendPath("PrimvarST"))
-    st_reader.CreateIdAttr("UsdPrimvarReader_float2")
-    st_reader.CreateInput("varname", Sdf.ValueTypeNames.Token).Set("st")
-    st_out = st_reader.CreateOutput("result", Sdf.ValueTypeNames.Float2)
-
-    # Albedo / diffuse
-    if albedo_tex and Path(albedo_tex).exists():
-        try:
-            albedo_node = UsdShade.Shader.Define(st, mat_path.AppendPath("AlbedoTex"))
-            albedo_node.CreateIdAttr("UsdUVTexture")
-            albedo_node.CreateInput("file", Sdf.ValueTypeNames.Asset).Set(str(albedo_tex))
-            albedo_node.CreateInput("sourceColorSpace", Sdf.ValueTypeNames.Token).Set("sRGB")
-            albedo_node.CreateInput("st", Sdf.ValueTypeNames.Float2).ConnectToSource(st_out)
-            shader.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f)\
-                  .ConnectToSource(albedo_node.CreateOutput("rgb", Sdf.ValueTypeNames.Float3))
-        except Exception as e:
-            print(f"[material][ERROR] Failed to load albedo texture: {e}")
-            shader.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).Set(
-                Gf.Vec3f(args.albedo, args.albedo, args.albedo)
-            )
-            print("[material] Fallback: using flat diffuse based on lunar albedo")
-    else:
-        shader.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).Set(
-            Gf.Vec3f(args.albedo, args.albedo, args.albedo)
-        )
-        print("[material] No albedo texture; using flat diffuse based on lunar albedo")
-
-    # Normal map (correct: UsdNormalMap). No duplicate/ direct RGB hookup.
-    if normal_tex and Path(normal_tex).exists():
-        try:
-            ntex = UsdShade.Shader.Define(st, mat_path.AppendPath("NormalTex"))
-            ntex.CreateIdAttr("UsdUVTexture")
-            ntex.CreateInput("file", Sdf.ValueTypeNames.Asset).Set(str(normal_tex))
-            ntex.CreateInput("sourceColorSpace", Sdf.ValueTypeNames.Token).Set("raw")
-            ntex.CreateInput("st", Sdf.ValueTypeNames.Float2).ConnectToSource(st_out)
-
-            nmap = UsdShade.Shader.Define(st, mat_path.AppendPath("NormalMap"))
-            nmap.CreateIdAttr("UsdNormalMap")
-            nmap.CreateInput("in", Sdf.ValueTypeNames.Float3)\
-                .ConnectToSource(ntex.CreateOutput("rgb", Sdf.ValueTypeNames.Float3))
-            nmap.CreateInput("scale", Sdf.ValueTypeNames.Float).Set(float(args.normal_scale))
-
-            shader.CreateInput("normal", Sdf.ValueTypeNames.Normal3f)\
-                .ConnectToSource(ntex.CreateOutput("rgb", Sdf.ValueTypeNames.Float3))
-        except Exception as e:
-            print(f"[material][ERROR] Failed to load normal map: {e}")
-    else:
-        print("[material] No normal texture provided")
-
-    # Optional AO (R channel of AO/ORD map) to 'occlusion'
-    if args.use_ao and ao_tex and Path(ao_tex).exists():
-        aot = UsdShade.Shader.Define(st, mat_path.AppendPath("AO_Tex"))
-        aot.CreateIdAttr("UsdUVTexture")
-        aot.CreateInput("file", Sdf.ValueTypeNames.Asset).Set(str(ao_tex))
-        aot.CreateInput("sourceColorSpace", Sdf.ValueTypeNames.Token).Set("raw")
-        aot.CreateInput("st", Sdf.ValueTypeNames.Float2).ConnectToSource(st_out)
-        shader.CreateInput("occlusion", Sdf.ValueTypeNames.Float)\
-            .ConnectToSource(aot.CreateOutput("r", Sdf.ValueTypeNames.Float))
-
-    # Bind
-    surface_output = material.CreateSurfaceOutput()
-    shader_surface_output = shader.CreateOutput("surface", Sdf.ValueTypeNames.Token)
-    surface_output.ConnectToSource(shader_surface_output)
-    UsdShade.MaterialBindingAPI(mesh).Bind(material)
-    print(f"[launch_isaac] Bound PreviewSurface to {prim_path} (roughness={args.roughness}, metallic={args.metallic})")
-    return True
-
-# -------------------------------
 # Frame camera on terrain (best-effort; version-safe)
 # -------------------------------
 
@@ -290,50 +274,71 @@ def frame_view_on_prim(prim_path: str) -> bool:
 stage_path = str(Path(args.usd).expanduser().resolve())
 open_stage(stage_path)
 
-# Lighting mode
+# Author lightning on the loaded stage
+set_sun(args.sun_az, args.sun_el, args.sun_intensity, args.sun_exposure)
 if args.viewport == "stage":
     disable_viewport_light_rig()
 else:
     print("[lighting] Using DEFAULT viewport light rig (not lunar realistic).")
-
-if args.black_sky:
-    disable_dome_and_skylights()
-
-# South-pole: low sun; use exposure to control brightness
-set_sun(args.sun_az, args.sun_el, args.sun_intensity, args.sun_exposure)
+disable_dome_and_skylights()
+effective_sun_I = args.sun_intensity * (2.0 ** args.sun_exposure)  # exposure into intensity
+add_fill_light(args.fill_ratio, effective_sun_I)
 
 # Path tracing quality
-configure_path_tracing()
+configure_renderer_settings(args)
 
 # Material on /World/Terrain if present (unless user wants to preserve original)
 if not args.skip_material:
-    root = Path(stage_path).parent
-    albedo = root / "assets" / "textures" / "regolith" / "T_Dry_Sand_combined_equal_4K_D.png"
-    normal = root / "assets" / "textures" / "regolith" / "T_Dry_Sand_combined_equal_4K_N.png"
-    # Try to find an AO/ORD map next to them
-    ao     = root / "assets" / "textures" / "regolith" / "T_Dry_Sand_combined_equal_4K_ORD.png"
+    # Use set_regolith.py for material binding
+    from set_regolith import make_and_bind_regolith
 
-    print(f"[set_regolith] Albedo: file={albedo} exists={albedo.exists()}")
-    print(f"[set_regolith] Normal: file={normal} exists={normal.exists()}")
-    if args.use_ao:
-        print(f"[set_regolith] AO/ORD: file={ao} exists={ao.exists()}")
+    root = Path(__file__).parent.parent.parent  # Points to South_Pole_DEMs
+    tex_dir = root / "assets" / "textures" / "regolith"
+    mesh_path = "/World/Terrain"
 
-    _ = force_preview_surface_on_prim(
-        "/World/Terrain",
-        albedo_tex=albedo if albedo.exists() else None,
-        normal_tex=None if args.no_normal else (normal if normal.exists() else None),
-        ao_tex=ao if (args.use_ao and ao.exists()) else None
+    stage = get_stage()
+    ok = make_and_bind_regolith(
+        stage,
+        mesh_path,
+        tex_dir=str(tex_dir),
+        tile_meters=2.0,
+        verbose=True
     )
-    print(f"[launch_isaac] Material summary: "
-          f"Albedo={'YES' if albedo.exists() else 'NO'}, "
-          f"Normal={'YES' if (not args.no_normal and normal.exists()) else 'NO'}, "
-          f"AO={'YES' if (args.use_ao and ao.exists()) else 'NO'}")
+    print(f"[launch_isaac] make_and_bind_regolith returned: {ok}")
 else:
     print("[material] --skip-material set: preserving original material on /World/Terrain")
 
 framed = frame_view_on_prim("/World/Terrain")
 print(f"[launch_isaac] View framed: {framed}")
 print("[launch_isaac] Ready.")
+
+# import sys
+# sys.path.append(str(Path(__file__).parent.parent / "helper"))
+
+# if args.inspect_omnigraph:
+#     from inspect_omnigraph import inspect_omnigraph
+#     inspect_omnigraph()
+
+from spawn_rover import ensure_physics_scene, apply_terrain_physics, spawn_asset, world_range_for_path
+
+stage = get_stage()
+if args.asset_center:
+    r = world_range_for_path(stage, "/World/Terrain")
+    if r:
+        args.asset_x = 0.5 * (r.GetMin()[0] + r.GetMax()[0])
+        args.asset_y = 0.5 * (r.GetMin()[1] + r.GetMax()[1])
+        print(f"[spawn_asset] Centering on terrain: x={args.asset_x:.3f}, y={args.asset_y:.3f}")
+ensure_physics_scene(stage, moon=args.moon)
+apply_terrain_physics(stage, "/World/Terrain")
+
+spawn_asset(
+    stage,
+    usd_path=args.asset_usd,
+    name=args.asset_name,
+    x=args.asset_x, y=args.asset_y, yaw_deg=args.asset_yaw,
+    drop_margin=args.drop_margin,
+    terrain_path="/World/Terrain",
+)
 
 # -------------------------------
 # Sim loop

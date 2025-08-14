@@ -70,7 +70,7 @@ def _author_st_primvar(mesh_prim: Usd.Prim, repeats_uv):
 
 def make_and_bind_regolith(stage: Usd.Stage, mesh_path: str,
                            tex_dir: Optional[str] = None,
-                           tile_meters: float = 10.0,
+                           tile_meters: float = 2.0,
                            verbose: bool = True) -> bool:
     mesh_prim = stage.GetPrimAtPath(mesh_path)
     if not mesh_prim or not mesh_prim.IsA(UsdGeom.Mesh):
@@ -85,6 +85,8 @@ def make_and_bind_regolith(stage: Usd.Stage, mesh_path: str,
     mn, mx = ext[0], ext[1]
     sx, sy, sz = float(mx[0] - mn[0]), float(mx[1] - mn[1]), float(mx[2] - mn[2])
     dbg(f"Terrain extent meters: sx={sx:.3f}, sy={sy:.3f}, sz={sz:.3f}")
+
+    dbg(f"Tile meters parameter: {tile_meters}")
 
     tile = max(float(tile_meters), 1e-6)
     rep_u, rep_v = sx / tile, sy / tile
