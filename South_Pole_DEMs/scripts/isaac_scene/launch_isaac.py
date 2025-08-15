@@ -18,13 +18,12 @@ ap.add_argument("--headless", action="store_true")
 ap.add_argument("--viewport", choices=["default", "stage"], default="stage",
                 help="default = Omniverse default viewport lights on; stage = only lights authored on the stage")
 ap.add_argument("--black-sky", action="store_true", help="Disable any Dome/Sky lights for a moon-like sky")
-# ap.add_argument("--inspect-omnigraph", action="store_true", help="Print Omnigraph nodes after stage setup")
 
 # Sun parameters
 ap.add_argument("--sun-az", type=float, default=120.0, help="Azimuth in degrees")
 ap.add_argument("--sun-el", type=float, default=8.0, help="Elevation in degrees above horizon")
 ap.add_argument("--sun-intensity", type=float, default=3000.0, help="UsdLux intensity (unitless multiplier)")
-ap.add_argument("--sun-exposure", type=float, default=0.0, help="UsdLux exposure (EV offset)")
+ap.add_argument("--sun-exposure", type=float, default=0.01, help="UsdLux exposure (EV offset)")
 
 ap.add_argument("--fill-ratio", type=float, default=0.0,
                 help="0..1 fraction of sun intensity used for a dim ambient fill (0 = off)")
@@ -43,7 +42,7 @@ ap.add_argument("--asset-name", default="asset", help="Name under /World")
 ap.add_argument("--asset-x", type=float, default=0.0)
 ap.add_argument("--asset-y", type=float, default=0.0)
 ap.add_argument("--asset-yaw", type=float, default=0.0)
-ap.add_argument("--drop-margin", type=float, default=0.05, help="Meters to drop above terrain")
+ap.add_argument("--drop-margin", type=float, default=0.00, help="Meters to drop above terrain")
 ap.add_argument("--moon", action="store_true", help="Use 1.62 m/s^2 gravity (lunar)")
 ap.add_argument("--asset-center", action="store_true",
                 help="Place asset at the center of /World/Terrain")
@@ -271,6 +270,16 @@ def frame_view_on_prim(prim_path: str) -> bool:
 # Open file and configure
 # -------------------------------
 
+from pathlib import Path
+import sys
+
+_THIS = Path(__file__).resolve()
+_SCRIPT_DIR = _THIS.parent.parent
+if str(_SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPT_DIR))
+
+from helper.terrain_debug import print_terrain_elevation, debug_asset_vs_terrain
+
 stage_path = str(Path(args.usd).expanduser().resolve())
 open_stage(stage_path)
 
@@ -312,39 +321,60 @@ framed = frame_view_on_prim("/World/Terrain")
 print(f"[launch_isaac] View framed: {framed}")
 print("[launch_isaac] Ready.")
 
-# import sys
-# sys.path.append(str(Path(__file__).parent.parent / "helper"))
-
-# if args.inspect_omnigraph:
-#     from inspect_omnigraph import inspect_omnigraph
-#     inspect_omnigraph()
-
-from spawn_rover import ensure_physics_scene, apply_terrain_physics, spawn_asset, world_range_for_path
+from spawn_rover import ensure_physics_scene, apply_terrain_physics, spawn_asset, world_range_for_path, snap_to_ground
 
 stage = get_stage()
-if args.asset_center:
-    r = world_range_for_path(stage, "/World/Terrain")
-    if r:
-        args.asset_x = 0.5 * (r.GetMin()[0] + r.GetMax()[0])
-        args.asset_y = 0.5 * (r.GetMin()[1] + r.GetMax()[1])
-        print(f"[spawn_asset] Centering on terrain: x={args.asset_x:.3f}, y={args.asset_y:.3f}")
+
+print_terrain_elevation(stage, "/World/Terrain")
+
 ensure_physics_scene(stage, moon=args.moon)
 apply_terrain_physics(stage, "/World/Terrain")
 
-spawn_asset(
+spawn_x, spawn_y = args.asset_x, args.asset_y
+if args.asset_center:
+    r = world_range_for_path(stage, "/World/Terrain")
+    if r:
+        spawn_x = 0.5 * (float(r.GetMin()[0]) + float(r.GetMax()[0]))
+        spawn_y = 0.5 * (float(r.GetMin()[1]) + float(r.GetMax()[1]))
+        print(f"[spawn] --asset-center requested -> using center ({spawn_x:.3f}, {spawn_y:.3f})")
+
+prim_path = spawn_asset(
     stage,
     usd_path=args.asset_usd,
     name=args.asset_name,
-    x=args.asset_x, y=args.asset_y, yaw_deg=args.asset_yaw,
+    x=spawn_x, y=spawn_y, yaw_deg=args.asset_yaw,
     drop_margin=args.drop_margin,
     terrain_path="/World/Terrain",
+    orient_to_slope=True,
 )
 
-# -------------------------------
-# Sim loop
-# -------------------------------
+from isaacsim.core.api import SimulationContext
+sim = SimulationContext()
+sim.set_simulation_dt(1.0/60.0)
+sim.play()
 
+# small warmup so the referenced USD is fully ready
+for _ in range(30):
+    sim.step(render=False)
+
+from locomotion import drive_diff
+
+drive = drive_diff.run(
+    stage,
+    prim_hint=f"/World/{args.asset_name}",  # e.g. /World/jackal  (will auto-resolve /payload)
+    seconds=None,                           # run until you close the app
+    hz=60.0,
+    wheel_radius=0.098,                     # Jackal-ish
+    wheel_base=0.375,                       # Jackal-ish
+    # left_key="left", right_key="right",   # override for other robots if names differ
+)
+
+# main loop: tick the driver and the sim
 while simulation_app.is_running():
-    simulation_app.update()
+    try:
+        next(drive)     # advance one control step
+    except StopIteration:
+        break
+    sim.step(render=True)
 
 simulation_app.close()
