@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 import sys
+import time
 
 from isaacsim import SimulationApp
 
@@ -18,6 +19,8 @@ ap.add_argument("--renderer", default="RayTracedLighting", help="E.g. 'RayTraced
 ap.add_argument("--headless", action="store_true")
 ap.add_argument("--viewport", choices=["default", "stage"], default="stage",
                 help="default = Omniverse default viewport lights on; stage = only lights authored on the stage")
+ap.add_argument("--real-time", action="store_true",
+                    help="Throttle stepping so wall time matches simulated time.")
 ap.add_argument("--black-sky", action="store_true", help="Disable any Dome/Sky lights for a moon-like sky")
 
 # Sun parameters
@@ -28,6 +31,16 @@ ap.add_argument("--sun-exposure", type=float, default=0.01, help="UsdLux exposur
 
 ap.add_argument("--fill-ratio", type=float, default=0.0,
                 help="0..1 fraction of sun intensity used for a dim ambient fill (0 = off)")
+
+# Birds-eye view camera
+ap.add_argument("--birdseye", action="store_true",
+                help="Create a top-down camera and switch the viewport to it.")
+ap.add_argument("--cam-height", type=float, default=8.0,
+                help="Bird's-eye camera height above the robot (meters).")
+ap.add_argument("--cam-parent", action="store_true",
+                help="Parent camera under the robot (follows + rotates with robot). "
+                         "If omitted, camera follows in world frame (no pitch/roll).")
+
 
 # Material knobs (applied to /World/Terrain if not skipped)
 ap.add_argument("--skip-material", action="store_true",
@@ -53,8 +66,6 @@ ap.add_argument("--vx", type=float, default=0.5, help="Forward speed (m/s)")
 ap.add_argument("--yaw-rate", type=float, default=0.0, help="Yaw rate (rad/s); 0 = straight line")
 ap.add_argument("--duration", type=float, default=20.0, help="How long to drive (s)")
 ap.add_argument("--hz", type=float, default=60.0, help="Control/physics rate (Hz)")
-# ap.add_argument("--wheel-radius", type=float, default=0.098, help="Wheel radius (m)")
-# ap.add_argument("--wheel-base", type=float, default=0.375, help="Wheel base (m)")
 
 # Constraints
 ap.add_argument("--dust-mu-scale", type=float, default=1.0, help="Terrain friction scale (μd & μs)")
@@ -79,7 +90,7 @@ from locomotion.constraints import (
 )
 
 import omni.usd
-from pxr import Usd, UsdPhysics, PhysxSchema
+from pxr import Usd, UsdPhysics, UsdGeom, PhysxSchema, Gf
 
 from set_lighting import setup_daylight, configure_renderer_settings
 from helper.terrain_debug import print_terrain_elevation
@@ -93,8 +104,9 @@ from spawn_rover import (
 
 from isaacsim.core.api import SimulationContext
 from locomotion import straight_line as SL
-from omni.kit.viewport.utility import get_active_viewport_window
+from omni.kit.viewport.utility import get_active_viewport, get_active_viewport_window
 import omni.kit.commands
+from omni.isaac.dynamic_control import _dynamic_control as dc
 
 # -------------------------------
 # Helpers
@@ -109,6 +121,33 @@ def open_stage(path: str):
     st = ctx.get_stage()
     st.SetTimeCodesPerSecond(60)
     print(f"[launch_isaac] Opened stage: {path}")
+
+def _step_rt(sim, start, step_idx: int, t0: float, dt: float, render: bool):
+    sim.step(render=render)
+    if args.real_time:
+        target = start + (step_idx + 1) * dt
+        while True:
+            now = time.perf_counter()
+            if now >= target:
+                break
+            time.sleep(target - now)
+
+def _wheel_sign_for_joint(stage, joint_path: str) -> float:
+    """Return +1 for left wheels, -1 for right wheels (name-based with a position fallback)."""
+    jprim = stage.GetPrimAtPath(joint_path)
+    name = jprim.GetName().lower()
+    if "right" in name:
+        return -1.0
+    if "left" in name:
+        return +1.0
+    # Fallback: use Y position to infer side (x-forward, y-left convention)
+    from pxr import UsdGeom, Usd
+    try:
+        M = UsdGeom.Xformable(jprim).ComputeLocalToWorldTransform(Usd.TimeCode.Default())
+        y = float(M.ExtractTranslation()[1])
+        return 1.0 if y >= 0.0 else -1.0
+    except Exception:
+        return 1.0
 
 # -------------------------------
 # Extract rover features, friction, gravity, and effective mass
@@ -167,41 +206,57 @@ class TiltSampler:
 # Frame camera on terrain (best-effort; version-safe)
 # -------------------------------
 
-def frame_view_on_prim(prim_path: str) -> bool:
+def _get_active_viewport():
     try:
-        vpw = get_active_viewport_window()
-        if vpw:
-            omni.kit.commands.execute("SelectPrims", old_selected_paths=[], new_selected_paths=[prim_path], expand_in_stage=True)
-            if hasattr(vpw, "frame_selection"):
-                vpw.frame_selection()
-                return True
-    except Exception as e:
-        print(f"[frame][WARN] {e}")
-    return False
+        vp = get_active_viewport_window()
+        if vp:
+            return vp
+    except Exception:
+        pass
+    try:
+        return get_active_viewport()  # older/newer API fallback
+    except Exception:
+        return None
+
+def frame_view_on_prim(path: str) -> bool:
+    vp = _get_active_viewport()
+    if not vp:
+        print("[frame] No active viewport yet")
+        return False
+    omni.kit.commands.execute(
+        "SelectPrims",
+        old_selection=[],
+        new_selection=[path],
+        expand_in_stage=True,
+    )
+    # different Isaac/Kit versions use one of these:
+    if hasattr(vp, "frame_selection"):
+        vp.frame_selection()
+    elif hasattr(vp, "new_frame_selection"):
+        vp.new_frame_selection()
+    else:
+        omni.kit.commands.execute("FrameSelection")
+    return True
 
 # Articulation root finder
 def find_articulation_root_path(root_path: str) -> str | None:
-    st = get_stage()
-    root = st.GetPrimAtPath(root_path)
-    if not root or not root.IsValid():
-        print(f"[articulation] Prim not found: {root_path}")
-        return None
-
-    # check the prim itself
+    candidates = []
     try:
         if root.HasAPI(UsdPhysics.ArticulationRootAPI):
-            return root_path
+            candidates.append(root_path)
     except Exception:
         pass
-
-    # correct traversal: iterate the subtree rooted at `root`
     for p in Usd.PrimRange(root):
         try:
             if p.HasAPI(UsdPhysics.ArticulationRootAPI):
-                return p.GetPath().pathString
+                candidates.append(p.GetPath().pathString)
         except Exception:
             pass
-    return None
+    if not candidates:
+        return None
+    # Prefer the highest (shortest) path like "/World/jackal", not a deep child like ".../payload"
+    candidates.sort(key=lambda s: s.count("/"))
+    return candidates[0]
 
 # -------------------------------
 # Open file and configure
@@ -240,6 +295,9 @@ print_terrain_elevation(stage, "/World/Terrain")
 ensure_physics_scene(stage, moon=args.moon)
 apply_terrain_physics(stage, "/World/Terrain")
 
+dt = 1.0 / args.hz
+sim = SimulationContext(physics_dt=dt, rendering_dt=dt)
+
 # -------------------------------
 # Spawn robot
 # -------------------------------
@@ -264,19 +322,69 @@ prim_path = spawn_asset(
 )
 
 # -------------------------------
-# Warm up sim
+# Camera view
 # -------------------------------
-sim = SimulationContext()
-sim.set_simulation_dt(1.0 / args.hz)
-sim.play()
 
-# small warmup so the referenced USD is fully ready
-for _ in range(30):
-    sim.step(render=False)
+def create_birdseye_camera(stage, follow_path, height, parent):
+    if parent:
+        cam_path = f"{follow_path}/TopDownCam"
+    else:
+        cam_path = "/World/TopDownCam"
 
-# Choose control prim (articulation root if present)
-prim_for_ctrl = find_articulation_root_path(prim_path) or prim_path
-print(f"[launch_isaac] Control prim: {prim_for_ctrl}")
+    cam = UsdGeom.Camera.Define(stage, cam_path)
+
+    # Clear any existing xform ops, then place above the robot.
+    xform = UsdGeom.Xformable(cam)
+    for op in xform.GetOrderedXformOps():
+        xform.RemoveXformOp(op)
+    # Camera looks along -Z by default; placing it at +Z above the robot makes it look down.
+    xform.AddTranslateOp().Set(Gf.Vec3d(0.0, 0.0, height))
+    cam.CreateClippingRangeAttr().Set(Gf.Vec2f(0.1, 5000.0))
+
+    # If we want it to move with the robot automatically, parent it now.
+    if parent:
+        cam_prim = stage.GetPrimAtPath(cam_path)
+        # (Already authored under follow_path by using the composed path above.)
+    else:
+        # Not parented: we'll update its world translation each step.
+        pass
+
+    # Switch the viewport to this camera if possible
+    try:
+        win = get_active_viewport_window()
+        if win:
+            vp = _get_active_viewport()
+            if vp:
+                try:
+                    vp.set_active_camera(cam_path)
+                except Exception:
+                    # some builds want a prim instead of path
+                    vp.set_active_camera(stage.GetPrimAtPath(cam_path))
+            else:
+                # Fallback: just frame the camera selection
+                omni.kit.commands.execute(
+                    "SelectPrims", old_selected_paths=[], new_selected_paths=[cam_path], expand_in_stage=True
+                )
+                try:
+                    win.frame_selection()
+                except Exception:
+                    omni.kit.commands.execute("FrameSelection")
+    except Exception as e:
+        print(f"[camera] Could not set active viewport camera: {e}")
+    return cam_path
+
+# If DC can't see an articulation at prim_for_ctrl, try its parent or the asset root.
+try:
+    dcif = dc.acquire_dynamic_control_interface()
+    if not dcif.get_articulation(prim_for_ctrl):
+        from pathlib import Path as _P
+        for try_path in [str(_P(prim_for_ctrl).parent).replace("\\","/"), prim_path]:
+            if dcif.get_articulation(try_path):
+                prim_for_ctrl = try_path
+                print(f"[launch_isaac] Switched control prim to articulation root: {prim_for_ctrl}")
+                break
+except Exception:
+    pass
 
 # -------------------------------
 # Pull rover features straight from USD
@@ -294,6 +402,11 @@ print(
 
 wheel_radius = feats.wheel_radius_m or 0.0
 wheel_base   = feats.wheel_base_m or 0.0
+
+# Camera after we know the moving body
+if args.birdseye:
+    _follow = feats.base_link_path or prim_for_ctrl
+    create_birdseye_camera(stage, _follow, args.cam_height, args.cam_parent)
 
 # -------------------------------
 # Constraints (friction scaling + extra masses)
@@ -315,44 +428,83 @@ if args.require_los:
         sys.exit(3)
 
 # -------------------------------
-# Drive straight for args.duration
+# Drive straight for args.duration  (robust DC fallback)
 # -------------------------------
-start_pos = world_translation(stage, prim_for_ctrl)
-tilts: list[float] = []
-ts = TiltSampler(stage, prim_for_ctrl)
+
+# Use the base link (moves in world) for telemetry, not the articulation root
+body_path = (feats.base_link_path or prim_for_ctrl)
+start_pos = world_translation(stage, body_path)
+ts = TiltSampler(stage, body_path)
+
+def _ensure_drive(jprim):
+    """Keep this tiny helper in case DC isn't available."""
+    drv = UsdPhysics.DriveAPI(jprim, "angular")
+    if not drv:
+        drv = UsdPhysics.DriveAPI.Apply(jprim, "angular")
+    if drv:
+        # big torque budget + some damping; zero position stiffness
+        (drv.GetMaxForceAttr() or drv.CreateMaxForceAttr()).Set(1e6)
+        (drv.GetDampingAttr()    or drv.CreateDampingAttr()).Set(50.0)
+        (drv.GetStiffnessAttr()  or drv.CreateStiffnessAttr()).Set(0.0)
+    try:
+        px = PhysxSchema.PhysxDriveAPI(jprim) if jprim.HasAPI(PhysxSchema.PhysxDriveAPI) else PhysxSchema.PhysxDriveAPI.Apply(jprim)
+        if px:
+            (px.GetMaxForceAttr() or px.CreateMaxForceAttr()).Set(1e6)
+    except Exception:
+        pass
+    return drv
 
 def _set_joint_target_velocity(joint_path: str, omega: float) -> bool:
-    """Attempt to set an angular drive target velocity on a joint."""
     try:
         jprim = stage.GetPrimAtPath(joint_path)
-        # Use the USD Physics Drive API (angular drive)
-        drv = UsdPhysics.DriveAPI(jprim, "angular")
-        if not drv:
-            # If no drive authored, apply one so we can command velocity.
-            drv = UsdPhysics.DriveAPI.Apply(jprim, "angular")
-        attr = drv.GetTargetVelocityAttr()
-        if not attr:
-            attr = drv.CreateTargetVelocityAttr()
-        attr.Set(float(omega))
-        # Give it some damping/stiffness if missing (prevents oscillations)
-        if not drv.GetDampingAttr().Get():
-            drv.CreateDampingAttr().Set(50.0)
-        if not drv.GetStiffnessAttr().Get():
-            drv.CreateStiffnessAttr().Set(0.0)
-        return True
+        drv = _ensure_drive(jprim)
+        if drv:
+            (drv.GetTargetVelocityAttr() or drv.CreateTargetVelocityAttr()).Set(float(omega))
+            return True
     except Exception as e:
         print(f"[drive][WARN] unable to set target velocity on {joint_path}: {e}")
-        return False
+    return False
 
-def _zero_all_drives():
-    for jp in getattr(feats, "drive_joint_paths", []) or []:
-        _set_joint_target_velocity(jp, 0.0)
+def _dc_drive_wheels(art_root_path: str, omega: float, zero_after: bool = True) -> int:
+    try:
+        from omni.isaac.dynamic_control import _dynamic_control as dc
+        dcif = dc.acquire_dynamic_control_interface()
+    except Exception as e:
+        print(f"[dc][WARN] dynamic_control not available: {e}")
+        return 0
 
-# Try a proper straight-line controller if available
+    try:
+        art = dcif.get_articulation(art_root_path)
+        if not art:
+            print(f"[dc][WARN] no articulation at {art_root_path}")
+            return 0
+
+        count = dcif.get_articulation_dof_count(art)
+        ok = 0
+        for i in range(count):
+            dof = dcif.get_articulation_dof(art, i)
+            name = (dcif.get_dof_name(dof) or "").lower()
+            if "wheel" in name and "steer" not in name:
+                dcif.set_dof_velocity_target(dof, float(omega))
+                ok += 1
+        print(f"[dc] commanded ±ω on {ok} wheel DOFs")
+        return ok if ok > 0 else 0
+    except Exception as e:
+        print(f"[dc][WARN] drive failed: {e}")
+        return 0
+
+def _zero_all_drives(omega_zero: float = 0.0):
+    # Try to zero via DC first, then via DriveAPI
+    dc_ok = _dc_drive_wheels(prim_for_ctrl, omega_zero, zero_after=False)
+    if dc_ok == 0:
+        for jp in getattr(feats, "drive_joint_paths", []) or []:
+            _set_joint_target_velocity(jp, omega_zero)
+
+# Try the repo controller first
+metrics = {}
 ran_controller = False
 try:
     if hasattr(SL, "run"):
-        # Expected signature in our repo; safely try it
         run_out = SL.run(
             stage=stage,
             art_root=prim_for_ctrl,
@@ -360,38 +512,43 @@ try:
             yaw_rate=args.yaw_rate,
             duration_s=args.duration,
             hz=args.hz,
-            tilt_cb=ts.sample,  # will be called each step
+            tilt_cb=ts.sample,
         )
         ran_controller = True
-        # allow downstream to see any metrics the controller produced
         metrics = run_out if isinstance(run_out, dict) else {}
 except Exception as e:
     print(f"[straight_line][WARN] SL.run() not available or failed: {e}")
 
+# Fallback controller (DC first, then raw DriveAPI)
+omega_cmd = None
 if not ran_controller:
-    # Fallback: command same wheel omega to all drive joints (straight line)
-    omega = (args.vx / max(1e-6, wheel_radius)) if wheel_radius > 0 else 0.0
-    ok_count = 0
-    for jp in getattr(feats, "drive_joint_paths", []) or []:
-        if _set_joint_target_velocity(jp, omega):
-            ok_count += 1
-    print(f"[drive] commanded ω={omega:.3f} rad/s on {ok_count}/{len(feats.drive_joint_paths)} drive joints")
+    wheel_r = feats.wheel_radius_m or 0.0
+    omega_cmd = (args.vx / max(1e-6, wheel_r)) if wheel_r > 0 else 0.0
 
-    # Step the sim for the requested duration
+    ok_dc = _dc_drive_wheels(prim_for_ctrl, omega_cmd)
+    if ok_dc == 0:
+        ok = 0
+        for jp in getattr(feats, "drive_joint_paths", []) or []:
+            sgn = _wheel_sign_for_joint(stage, jp)
+            if _set_joint_target_velocity(jp, sgn * omega_cmd):
+                ok += 1
+        print(f"[drive] commanded ω=±{abs(omega_cmd):.3f} rad/s via DriveAPI on {ok}/{len(feats.drive_joint_paths)} joints")
+
     steps = max(1, int(args.duration * args.hz))
-    for _ in range(steps):
+    t0 = time.perf_counter()
+    for i in range(steps):
         ts.sample()
-        sim.step(render=not args.headless)
+        _step_rt(sim, time.perf_counter(), i, t0, dt, render=not args.headless)
 
-    # Stop wheels
     _zero_all_drives()
 
 # -------------------------------
-# Post-run quick metrics (proxy)
+# Post-run quick metrics (proxy + slip)
 # -------------------------------
-metrics = locals().get("metrics", {}) or {}
+d = distance_from(stage, body_path, start_pos)
+elapsed_s = metrics.get("elapsed_s", args.duration)
+avg_v_obs = (d / max(1e-6, elapsed_s))
 
-d = distance_from(stage, prim_for_ctrl, start_pos)
 g = get_gravity_mps2(stage, default_g=(1.62 if args.moon else 9.81))
 m_eff = effective_rover_mass_kg(stage, prim_for_ctrl, cfg)
 _, mu_d = get_terrain_friction(stage, "/World/Terrain")
@@ -400,43 +557,28 @@ E = proxy_energy_J(distance_m=d, mass_kg=m_eff, mu=mu_d, g=g)
 Jpm = (E / d) if d > 1e-9 else None
 cot = cost_of_transport(E_J=E, mass_kg=m_eff, g=g, distance_m=d)
 
-avg_v = (
-    metrics.get("avg_speed_mps")
-    if isinstance(metrics, dict) and "avg_speed_mps" in metrics
-    else (args.vx if getattr(args, "vx", None) is not None else (d / max(1e-6, args.duration)))
-)
+wheel_r = feats.wheel_radius_m or 0.0
+omega_for_slip = None
+if omega_cmd is not None:
+    omega_for_slip = omega_cmd
+elif feats.drive_target_omega is not None:
+    omega_for_slip = feats.drive_target_omega
 
-omega_for_slip = feats.drive_target_omega if feats.drive_target_omega is not None else (
-    (avg_v / max(1e-6, wheel_radius)) if wheel_radius > 0 else None
-)
-slip_i = slip_ratio_estimate(avg_v, wheel_radius, omega_for_slip)
+slip_i = slip_ratio_estimate(avg_v_obs, wheel_r if wheel_r > 0 else None, omega_for_slip)
 
 tilt_stats = ts.results()
-tilt_max = tilt_stats["tilt_max_deg"]
-tilt_rms = tilt_stats["tilt_rms_deg"]
-
 Jpm_str = f"{Jpm:.2f}" if Jpm is not None else "n/a"
 cot_str = f"{cot:.3f}" if cot is not None else "n/a"
-print(
-    f"[energy][proxy] d={d:.2f} m, μd={mu_d:.2f}, m={m_eff:.2f} kg"
-    f" -> E≈{E:.1f} J, J/m={Jpm_str}, CoT={cot_str}"
-)
+print(f"[energy][proxy] d={d:.2f} m, μd={mu_d:.2f}, m={m_eff:.2f} kg -> E≈{E:.1f} J, J/m={Jpm_str}, CoT={cot_str}")
 
-if getattr(args, "battery_kJ", 0.0) and Jpm is not None and Jpm > 0:
-    est_range_m = (args.battery_kJ * 1000.0) / Jpm
-    print(f"[range][est] With {args.battery_kJ:.1f} kJ budget: ~{est_range_m:.1f} m")
-
-if isinstance(metrics, dict):
-    metrics.update({
-        "elapsed_s": metrics.get("elapsed_s", args.duration),
-        "distance_m": d,
-        "avg_speed_mps": avg_v,
-        "energy_J": E,
-        "energy_per_m_Jpm": (Jpm or 0.0),
-        "cot": cot,
-        "slip_ratio_est": slip_i,
-        "tilt_max_deg": tilt_max,
-        "tilt_rms_deg": tilt_rms,
-    })
-
-print("[straight_line] metrics:", metrics)
+metrics.update({
+    "elapsed_s": elapsed_s,
+    "distance_m": d,
+    "avg_speed_mps": avg_v_obs,
+    "energy_J": E,
+    "energy_per_m_Jpm": (Jpm or 0.0),
+    "cot": cot,
+    "slip_ratio_est": slip_i,
+    "tilt_max_deg": tilt_stats["tilt_max_deg"],
+    "tilt_rms_deg": tilt_stats["tilt_rms_deg"],
+})
