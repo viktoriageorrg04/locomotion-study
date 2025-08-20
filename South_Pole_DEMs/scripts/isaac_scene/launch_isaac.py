@@ -122,15 +122,15 @@ def open_stage(path: str):
     st.SetTimeCodesPerSecond(60)
     print(f"[launch_isaac] Opened stage: {path}")
 
-def _step_rt(sim, start, step_idx: int, t0: float, dt: float, render: bool):
+def _step_rt(sim, step_idx: int, t0: float, dt: float, render: bool):
     sim.step(render=render)
     if args.real_time:
-        target = start + (step_idx + 1) * dt
+        target = t0 + (step_idx + 1) * dt
         while True:
-            now = time.perf_counter()
-            if now >= target:
+            remaining = target - time.perf_counter()
+            if remaining <= 0:
                 break
-            time.sleep(target - now)
+            time.sleep(min(remaining, 0.002))
 
 def _wheel_sign_for_joint(stage, joint_path: str) -> float:
     """Return +1 for left wheels, -1 for right wheels (name-based with a position fallback)."""
@@ -155,7 +155,7 @@ def _wheel_sign_for_joint(stage, joint_path: str) -> float:
 
 def auto_extract(stage, art_root, cfg):
     """Read rover features, friction, gravity, and effective mass straight from USD + cfg."""
-    feats = rover_features(stage, art_root)
+    feats = rover_features(stage, prim_for_ctrl)
     mu_s, mu_d = get_terrain_friction(stage, "/World/Terrain")
     g = get_gravity_mps2(stage)
     m_eff = effective_rover_mass_kg(stage, art_root, cfg)
@@ -207,14 +207,26 @@ class TiltSampler:
 # -------------------------------
 
 def _get_active_viewport():
+    """Return a viewport API object (not the window) across Kit versions."""
+    # Preferred: grab the active viewport window then take .viewport_api
     try:
-        vp = get_active_viewport_window()
-        if vp:
-            return vp
+        win = get_active_viewport_window()
+        if win and hasattr(win, "viewport_api"):
+            return win.viewport_api
     except Exception:
         pass
+
+    # Fallback: some builds return a viewport object directly
     try:
-        return get_active_viewport()  # older/newer API fallback
+        vp = get_active_viewport()
+        return getattr(vp, "viewport_api", vp)
+    except Exception:
+        pass
+
+    # Last resort: import get_viewport_interface lazily if present
+    try:
+        from omni.kit.viewport.utility import get_viewport_interface as _gvi
+        return _gvi().get_viewport_window(None).viewport_api
     except Exception:
         return None
 
@@ -223,40 +235,34 @@ def frame_view_on_prim(path: str) -> bool:
     if not vp:
         print("[frame] No active viewport yet")
         return False
-    omni.kit.commands.execute(
-        "SelectPrims",
-        old_selection=[],
-        new_selection=[path],
-        expand_in_stage=True,
-    )
-    # different Isaac/Kit versions use one of these:
+
+    # Select the prim (handle both old/new Kit APIs)
+    try:
+        # Newer API
+        omni.kit.commands.execute(
+            "SelectPrims",
+            old_selected_paths=[],
+            new_selected_paths=[path],
+            expand_in_stage=True,
+        )
+    except TypeError:
+        # Older API
+        omni.kit.commands.execute(
+            "SelectPrims",
+            old_selection=[],
+            new_selection=[path],
+            expand_in_stage=True,
+        )
+    except Exception as e:
+        print(f"[frame] selection failed: {e}")
+        return False
+
+    # Frame it (handle version differences)
     if hasattr(vp, "frame_selection"):
         vp.frame_selection()
     elif hasattr(vp, "new_frame_selection"):
         vp.new_frame_selection()
-    else:
-        omni.kit.commands.execute("FrameSelection")
     return True
-
-# Articulation root finder
-def find_articulation_root_path(root_path: str) -> str | None:
-    candidates = []
-    try:
-        if root.HasAPI(UsdPhysics.ArticulationRootAPI):
-            candidates.append(root_path)
-    except Exception:
-        pass
-    for p in Usd.PrimRange(root):
-        try:
-            if p.HasAPI(UsdPhysics.ArticulationRootAPI):
-                candidates.append(p.GetPath().pathString)
-        except Exception:
-            pass
-    if not candidates:
-        return None
-    # Prefer the highest (shortest) path like "/World/jackal", not a deep child like ".../payload"
-    candidates.sort(key=lambda s: s.count("/"))
-    return candidates[0]
 
 # -------------------------------
 # Open file and configure
@@ -297,6 +303,7 @@ apply_terrain_physics(stage, "/World/Terrain")
 
 dt = 1.0 / args.hz
 sim = SimulationContext(physics_dt=dt, rendering_dt=dt)
+sim.play()
 
 # -------------------------------
 # Spawn robot
@@ -320,6 +327,46 @@ prim_path = spawn_asset(
     terrain_path="/World/Terrain",
     orient_to_slope=True,
 )
+
+# after: prim_path = spawn_asset(...)
+def find_articulation_root_path(stage, root_path):
+    from pxr import Usd, UsdPhysics
+    root = stage.GetPrimAtPath(root_path)
+    if not root or not root.IsValid():
+        return None
+    hits = []
+    try:
+        if root.HasAPI(UsdPhysics.ArticulationRootAPI):
+            hits.append(root_path)
+    except Exception:
+        pass
+    for p in Usd.PrimRange(root):
+        try:
+            if p.HasAPI(UsdPhysics.ArticulationRootAPI):
+                hits.append(p.GetPath().pathString)
+        except Exception:
+            pass
+    if not hits:
+        return None
+    hits.sort(key=lambda s: s.count("/"))
+    return hits[0]
+
+prim_for_ctrl = find_articulation_root_path(stage, prim_path) or prim_path
+print(f"[launch_isaac] Control prim: {prim_for_ctrl}")
+
+# If DC can't see an articulation here, try parent or the asset root.
+try:
+    from omni.isaac.dynamic_control import _dynamic_control as dc
+    dcif = dc.acquire_dynamic_control_interface()
+    if not dcif.get_articulation(prim_for_ctrl):
+        from pathlib import Path as _P
+        for try_path in [str(_P(prim_for_ctrl).parent).replace("\\","/"), prim_path]:
+            if dcif.get_articulation(try_path):
+                prim_for_ctrl = try_path
+                print(f"[launch_isaac] Switched control prim to articulation root: {prim_for_ctrl}")
+                break
+except Exception:
+    pass
 
 # -------------------------------
 # Camera view
@@ -351,24 +398,24 @@ def create_birdseye_camera(stage, follow_path, height, parent):
 
     # Switch the viewport to this camera if possible
     try:
-        win = get_active_viewport_window()
-        if win:
-            vp = _get_active_viewport()
-            if vp:
-                try:
-                    vp.set_active_camera(cam_path)
-                except Exception:
-                    # some builds want a prim instead of path
-                    vp.set_active_camera(stage.GetPrimAtPath(cam_path))
-            else:
-                # Fallback: just frame the camera selection
+        vp = _get_active_viewport()
+        if vp:
+            try:
+                vp.set_active_camera(cam_path)                      # string path works in newer builds
+            except Exception:
+                vp.set_active_camera(stage.GetPrimAtPath(cam_path)) # older builds want a prim
+
+            # Frame the camera prim via the viewport API when available
+            try:
                 omni.kit.commands.execute(
                     "SelectPrims", old_selected_paths=[], new_selected_paths=[cam_path], expand_in_stage=True
                 )
-                try:
-                    win.frame_selection()
-                except Exception:
-                    omni.kit.commands.execute("FrameSelection")
+            except Exception:
+                pass
+            if hasattr(vp, "frame_selection"):
+                vp.frame_selection()
+        else:
+            print("[camera] No active viewport API")
     except Exception as e:
         print(f"[camera] Could not set active viewport camera: {e}")
     return cam_path
@@ -465,9 +512,10 @@ def _set_joint_target_velocity(joint_path: str, omega: float) -> bool:
         print(f"[drive][WARN] unable to set target velocity on {joint_path}: {e}")
     return False
 
-def _dc_drive_wheels(art_root_path: str, omega: float, zero_after: bool = True) -> int:
+_name_to_path = {p.split("/")[-1].lower(): p for p in feats.drive_joint_paths or []}
+
+def _dc_drive_wheels(art_root_path: str, omega: float, name_to_path=None) -> int:
     try:
-        from omni.isaac.dynamic_control import _dynamic_control as dc
         dcif = dc.acquire_dynamic_control_interface()
     except Exception as e:
         print(f"[dc][WARN] dynamic_control not available: {e}")
@@ -485,20 +533,13 @@ def _dc_drive_wheels(art_root_path: str, omega: float, zero_after: bool = True) 
             dof = dcif.get_articulation_dof(art, i)
             name = (dcif.get_dof_name(dof) or "").lower()
             if "wheel" in name and "steer" not in name:
-                dcif.set_dof_velocity_target(dof, float(omega))
+                dcif.set_dof_velocity_target(dof, float(1.0 * omega))
                 ok += 1
-        print(f"[dc] commanded ±ω on {ok} wheel DOFs")
-        return ok if ok > 0 else 0
+        print(f"[dc] commanded per-wheel ±ω on {ok} wheel DOFs")
+        return ok
     except Exception as e:
         print(f"[dc][WARN] drive failed: {e}")
         return 0
-
-def _zero_all_drives(omega_zero: float = 0.0):
-    # Try to zero via DC first, then via DriveAPI
-    dc_ok = _dc_drive_wheels(prim_for_ctrl, omega_zero, zero_after=False)
-    if dc_ok == 0:
-        for jp in getattr(feats, "drive_joint_paths", []) or []:
-            _set_joint_target_velocity(jp, omega_zero)
 
 # Try the repo controller first
 metrics = {}
@@ -525,22 +566,21 @@ if not ran_controller:
     wheel_r = feats.wheel_radius_m or 0.0
     omega_cmd = (args.vx / max(1e-6, wheel_r)) if wheel_r > 0 else 0.0
 
-    ok_dc = _dc_drive_wheels(prim_for_ctrl, omega_cmd)
-    if ok_dc == 0:
-        ok = 0
-        for jp in getattr(feats, "drive_joint_paths", []) or []:
-            sgn = _wheel_sign_for_joint(stage, jp)
-            if _set_joint_target_velocity(jp, sgn * omega_cmd):
-                ok += 1
-        print(f"[drive] commanded ω=±{abs(omega_cmd):.3f} rad/s via DriveAPI on {ok}/{len(feats.drive_joint_paths)} joints")
+    # 1) DriveAPI with per-wheel sign
+    ok = 0
+    for jp in (feats.drive_joint_paths or []):
+        _set_joint_target_velocity(jp, omega_cmd)
+    if ok > 0:
+        print(f"[drive] commanded ω=±{abs(omega_cmd):.3f} rad/s via DriveAPI on {ok}/{len(feats.drive_joint_paths or [])} joints")
+    else:
+        # 2) Fallback: DC, still with per-wheel sign
+        ok_dc = _dc_drive_wheels(prim_for_ctrl, omega_cmd, _name_to_path)
 
     steps = max(1, int(args.duration * args.hz))
     t0 = time.perf_counter()
     for i in range(steps):
         ts.sample()
-        _step_rt(sim, time.perf_counter(), i, t0, dt, render=not args.headless)
-
-    _zero_all_drives()
+        _step_rt(sim, i, t0, dt, render=not args.headless)
 
 # -------------------------------
 # Post-run quick metrics (proxy + slip)

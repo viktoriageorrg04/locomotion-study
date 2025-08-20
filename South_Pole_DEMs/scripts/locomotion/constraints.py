@@ -134,6 +134,46 @@ def scale_terrain_friction(stage: Usd.Stage, scale: float, terrain_path: str = "
             return False
     return True
 
+def set_wheel_friction(stage, art_root: str, mu_s=1.5, mu_d=1.3):
+    """
+    Bind a physics material (via USD/PhysX *API schemas*) to all wheel collision
+    shapes under `art_root` (e.g. /World/jackal/payload).
+    """
+    wheel_mat_path = "/World/Looks/WheelMaterial"
+
+    # Create a container prim and author friction via APIs (no typed UsdPhysics.Material needed)
+    mat_prim = stage.GetPrimAtPath(wheel_mat_path)
+    if not mat_prim or not mat_prim.IsValid():
+        mat_prim = UsdGeom.Scope.Define(stage, wheel_mat_path).GetPrim()
+
+    # USD Physics friction
+    usd_mat = UsdPhysics.MaterialAPI.Apply(mat_prim)
+    (usd_mat.GetStaticFrictionAttr()  or usd_mat.CreateStaticFrictionAttr()).Set(float(mu_s))
+    (usd_mat.GetDynamicFrictionAttr() or usd_mat.CreateDynamicFrictionAttr()).Set(float(mu_d))
+
+    # PhysX combine mode: multiply (keeps traction if one side is low)
+    try:
+        px_mat = PhysxSchema.PhysxMaterialAPI.Apply(mat_prim)
+        (px_mat.GetFrictionCombineModeAttr() or px_mat.CreateFrictionCombineModeAttr()).Set("multiply")
+    except Exception:
+        pass
+
+    def _bind(prim):
+        try:
+            UsdPhysics.MaterialBindingAPI.Apply(prim).Bind(mat_prim)
+        except Exception:
+            pass
+
+    # Bind to colliders under anything that looks like a wheel link
+    for prim in stage.Traverse():
+        if art_root in prim.GetPath().pathString and "wheel" in prim.GetName().lower():
+            for child in prim.GetChildren():
+                n = child.GetName().lower()
+                if "collision" in n or "collisions" in n:
+                    for sub in child.GetChildren():
+                        if sub.IsA(UsdGeom.Xform) or sub.IsA(UsdGeom.Gprim) or sub.IsA(UsdGeom.Mesh):
+                            _bind(sub)
+
 # Mass / payload
 
 def _find_base_link(stage: Usd.Stage, art_root: str) -> Optional[Usd.Prim]:
@@ -480,6 +520,13 @@ def static_proxy_metrics(stage: Usd.Stage, art_root: str, cfg: ConstraintConfig,
 def apply_constraints(stage: Usd.Stage, art_root: str, cfg: ConstraintConfig):
     # Dust/friction
     scale_terrain_friction(stage, cfg.dust_mu_scale, "/World/Terrain")
-    # Add masses (robot shell + payload) onto the base link
+    # Add masses
     add_payload_mass(stage, art_root, cfg.robot_kg)
     add_payload_mass(stage, art_root, cfg.payload_kg)
+
+    # NEW: give wheels decent friction so they actually grip
+    try:
+        set_wheel_friction(stage, art_root, mu_s=1.5, mu_d=1.3)
+        print("[constraints] Wheel friction bound (μs=1.5, μd=1.3) on wheel colliders.")
+    except Exception as e:
+        print(f"[constraints][WARN] wheel friction binding failed: {e}")
