@@ -7,13 +7,16 @@ import time
 
 from isaacsim import SimulationApp
 
-# Add project root (…/South_Pole_DEMs/scripts) to import path
+# Add project root
 _THIS = Path(__file__).resolve()
 _SCRIPT_DIR = _THIS.parent.parent
 if str(_SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPT_DIR))
 
 ap = argparse.ArgumentParser("Open USD terrain in Isaac Sim, optionally bind regolith, set lunar lighting.")
+
+ap.add_argument('--controller', choices=['auto','dc','none','base-twist'], default='auto',
+               help='Select controller: auto (default), dc (wheeled), none, or base-twist proxy')
 ap.add_argument("--usd", required=True, help="Path to a USD/USDA stage to open")
 ap.add_argument("--renderer", default="RayTracedLighting", help="E.g. 'RayTracedLighting', 'PathTracing'")
 ap.add_argument("--headless", action="store_true")
@@ -84,13 +87,14 @@ simulation_app = SimulationApp({"renderer": args.renderer, "headless": args.head
 
 
 from locomotion.constraints import (
-    ConstraintConfig, apply_constraints, los_ok, world_translation,
-    distance_from, get_gravity_mps2, proxy_energy_J, rover_features, cost_of_transport, total_articulation_mass_kg, 
-    effective_rover_mass_kg, body_upright_tilt_deg, static_proxy_metrics, get_terrain_friction, slip_ratio_estimate
+    ConstraintConfig, apply_constraints, world_translation,
+    distance_from, get_gravity_mps2, proxy_energy_J, rover_features, cost_of_transport,
+    effective_rover_mass_kg, body_upright_tilt_deg, get_terrain_friction, slip_ratio_estimate
 )
 
 import omni.usd
-from pxr import Usd, UsdPhysics, UsdGeom, PhysxSchema, Gf
+from locomotion.controllers.registry import pick_controller
+from pxr import Usd, UsdPhysics, UsdGeom, Gf
 
 from set_lighting import setup_daylight, configure_renderer_settings
 from helper.terrain_debug import print_terrain_elevation
@@ -103,7 +107,6 @@ from spawn_rover import (
 )
 
 from isaacsim.core.api import SimulationContext
-from locomotion import straight_line as SL
 from omni.kit.viewport.utility import get_active_viewport, get_active_viewport_window
 import omni.kit.commands
 from omni.isaac.dynamic_control import _dynamic_control as dc
@@ -132,55 +135,9 @@ def _step_rt(sim, step_idx: int, t0: float, dt: float, render: bool):
                 break
             time.sleep(min(remaining, 0.002))
 
-def _wheel_sign_for_joint(stage, joint_path: str) -> float:
-    """Return +1 for left wheels, -1 for right wheels (name-based with a position fallback)."""
-    jprim = stage.GetPrimAtPath(joint_path)
-    name = jprim.GetName().lower()
-    if "right" in name:
-        return -1.0
-    if "left" in name:
-        return +1.0
-    # Fallback: use Y position to infer side (x-forward, y-left convention)
-    from pxr import UsdGeom, Usd
-    try:
-        M = UsdGeom.Xformable(jprim).ComputeLocalToWorldTransform(Usd.TimeCode.Default())
-        y = float(M.ExtractTranslation()[1])
-        return 1.0 if y >= 0.0 else -1.0
-    except Exception:
-        return 1.0
-
 # -------------------------------
 # Extract rover features, friction, gravity, and effective mass
 # -------------------------------
-
-def auto_extract(stage, art_root, cfg):
-    """Read rover features, friction, gravity, and effective mass straight from USD + cfg."""
-    feats = rover_features(stage, prim_for_ctrl)
-    mu_s, mu_d = get_terrain_friction(stage, "/World/Terrain")
-    g = get_gravity_mps2(stage)
-    m_eff = effective_rover_mass_kg(stage, art_root, cfg)
-    print(
-        "[features] mass={:.3f} kg, wheel_r={} m, wheelbase={} m, drives={}, ω_target={} rad/s, ω_max={} rad/s".format(
-            feats.total_mass_kg,
-            (None if feats.wheel_radius_m is None else f"{feats.wheel_radius_m:.9f}"),
-            (None if feats.wheel_base_m   is None else f"{feats.wheel_base_m:.9f}"),
-            len(feats.drive_joint_paths),
-            ("n/a" if feats.drive_target_omega is None else f"{feats.drive_target_omega:.3f}"),
-            ("n/a" if feats.drive_max_omega    is None else f"{feats.drive_max_omega:.3f}"),
-        )
-    )
-    return feats, mu_s, mu_d, g, m_eff
-
-def inject_proxy_energy_metrics(stage, art_root, cfg, dist_m, avg_v_mps):
-    """Compute energy/CoT/slip with the proxy model (no hard-coded params)."""
-    proxy = static_proxy_metrics(
-        stage=stage, art_root=art_root, cfg=cfg, distance_m=dist_m, avg_v_mps=avg_v_mps
-    )
-    # Pretty print one-liner for J/m & CoT
-    jpm = proxy["energy_per_m_Jpm"]
-    print(f"[energy][proxy] d={dist_m:.2f} m, μd={proxy['mu_d']:.2f}, m={proxy['mass_eff_kg']:.2f} kg "
-          f"-> E≈{proxy['energy_J']:.1f} J, J/m={jpm:.2f}, CoT={proxy['cot']:.3f}")
-    return proxy
 
 class TiltSampler:
     """Collect max & RMS tilt (upright deviation) while sim runs."""
@@ -330,7 +287,6 @@ prim_path = spawn_asset(
 
 # after: prim_path = spawn_asset(...)
 def find_articulation_root_path(stage, root_path):
-    from pxr import Usd, UsdPhysics
     root = stage.GetPrimAtPath(root_path)
     if not root or not root.IsValid():
         return None
@@ -354,9 +310,11 @@ def find_articulation_root_path(stage, root_path):
 prim_for_ctrl = find_articulation_root_path(stage, prim_path) or prim_path
 print(f"[launch_isaac] Control prim: {prim_for_ctrl}")
 
+for _ in range(5):
+    sim.step(render=not args.headless)
+
 # If DC can't see an articulation here, try parent or the asset root.
 try:
-    from omni.isaac.dynamic_control import _dynamic_control as dc
     dcif = dc.acquire_dynamic_control_interface()
     if not dcif.get_articulation(prim_for_ctrl):
         from pathlib import Path as _P
@@ -420,22 +378,10 @@ def create_birdseye_camera(stage, follow_path, height, parent):
         print(f"[camera] Could not set active viewport camera: {e}")
     return cam_path
 
-# If DC can't see an articulation at prim_for_ctrl, try its parent or the asset root.
-try:
-    dcif = dc.acquire_dynamic_control_interface()
-    if not dcif.get_articulation(prim_for_ctrl):
-        from pathlib import Path as _P
-        for try_path in [str(_P(prim_for_ctrl).parent).replace("\\","/"), prim_path]:
-            if dcif.get_articulation(try_path):
-                prim_for_ctrl = try_path
-                print(f"[launch_isaac] Switched control prim to articulation root: {prim_for_ctrl}")
-                break
-except Exception:
-    pass
-
 # -------------------------------
 # Pull rover features straight from USD
 # -------------------------------
+
 feats = rover_features(stage, prim_for_ctrl)
 print(
     "[features]"
@@ -447,144 +393,59 @@ print(
     f" ω_max={feats.drive_max_omega if feats.drive_max_omega else 'n/a'} rad/s"
 )
 
-wheel_radius = feats.wheel_radius_m or 0.0
-wheel_base   = feats.wheel_base_m or 0.0
-
 # Camera after we know the moving body
+cam_path = None
 if args.birdseye:
     _follow = feats.base_link_path or prim_for_ctrl
-    create_birdseye_camera(stage, _follow, args.cam_height, args.cam_parent)
+    cam_path = create_birdseye_camera(stage, _follow, args.cam_height, args.cam_parent)
 
 # -------------------------------
 # Constraints (friction scaling + extra masses)
 # -------------------------------
+
 cfg = ConstraintConfig(
     dust_mu_scale=args.dust_mu_scale,
     robot_kg=args.robot_kg,
     payload_kg=args.payload_kg,
     payload_offset_xyz=tuple(args.payload_offset),
-    check_los=args.require_los,
     energy_model=args.energy_model,
 )
 apply_constraints(stage, prim_for_ctrl, cfg)
 
-if args.require_los:
-    if not los_ok(stage, prim_for_ctrl, "/World/Terrain"):
-        print("[constraints] LOS requirement failed — aborting.")
-        simulation_app.close()
-        sys.exit(3)
+# -------------------------------
+# Pick controller
+# -------------------------------
 
-# -------------------------------
-# Drive straight for args.duration  (robust DC fallback)
-# -------------------------------
+metrics = {}
 
 # Use the base link (moves in world) for telemetry, not the articulation root
 body_path = (feats.base_link_path or prim_for_ctrl)
 start_pos = world_translation(stage, body_path)
 ts = TiltSampler(stage, body_path)
 
-def _ensure_drive(jprim):
-    """Keep this tiny helper in case DC isn't available."""
-    drv = UsdPhysics.DriveAPI(jprim, "angular")
-    if not drv:
-        drv = UsdPhysics.DriveAPI.Apply(jprim, "angular")
-    if drv:
-        # big torque budget + some damping; zero position stiffness
-        (drv.GetMaxForceAttr() or drv.CreateMaxForceAttr()).Set(1e6)
-        (drv.GetDampingAttr()    or drv.CreateDampingAttr()).Set(50.0)
-        (drv.GetStiffnessAttr()  or drv.CreateStiffnessAttr()).Set(0.0)
-    try:
-        px = PhysxSchema.PhysxDriveAPI(jprim) if jprim.HasAPI(PhysxSchema.PhysxDriveAPI) else PhysxSchema.PhysxDriveAPI.Apply(jprim)
-        if px:
-            (px.GetMaxForceAttr() or px.CreateMaxForceAttr()).Set(1e6)
-    except Exception:
-        pass
-    return drv
+# Pick and run the appropriate controller for this robot
+ctrl = pick_controller(stage, prim_for_ctrl, feats, preferred=args.controller)
+ctrl.start(vx=args.vx, yaw_rate=args.yaw_rate, hz=args.hz)
 
-def _set_joint_target_velocity(joint_path: str, omega: float) -> bool:
-    try:
-        jprim = stage.GetPrimAtPath(joint_path)
-        drv = _ensure_drive(jprim)
-        if drv:
-            (drv.GetTargetVelocityAttr() or drv.CreateTargetVelocityAttr()).Set(float(omega))
-            return True
-    except Exception as e:
-        print(f"[drive][WARN] unable to set target velocity on {joint_path}: {e}")
-    return False
+steps = max(1, int(args.duration * args.hz))
+t0 = time.perf_counter()
+for i in range(steps):
+    ts.sample()
+    ctrl.step()
+    _step_rt(sim, i, t0, dt, render=not args.headless)
+ctrl.shutdown()
 
-_name_to_path = {p.split("/")[-1].lower(): p for p in feats.drive_joint_paths or []}
-
-def _dc_drive_wheels(art_root_path: str, omega: float, name_to_path=None) -> int:
-    try:
-        dcif = dc.acquire_dynamic_control_interface()
-    except Exception as e:
-        print(f"[dc][WARN] dynamic_control not available: {e}")
-        return 0
-
-    try:
-        art = dcif.get_articulation(art_root_path)
-        if not art:
-            print(f"[dc][WARN] no articulation at {art_root_path}")
-            return 0
-
-        count = dcif.get_articulation_dof_count(art)
-        ok = 0
-        for i in range(count):
-            dof = dcif.get_articulation_dof(art, i)
-            name = (dcif.get_dof_name(dof) or "").lower()
-            if "wheel" in name and "steer" not in name:
-                dcif.set_dof_velocity_target(dof, float(1.0 * omega))
-                ok += 1
-        print(f"[dc] commanded per-wheel ±ω on {ok} wheel DOFs")
-        return ok
-    except Exception as e:
-        print(f"[dc][WARN] drive failed: {e}")
-        return 0
-
-# Try the repo controller first
-metrics = {}
-ran_controller = False
-try:
-    if hasattr(SL, "run"):
-        run_out = SL.run(
-            stage=stage,
-            art_root=prim_for_ctrl,
-            vx=args.vx,
-            yaw_rate=args.yaw_rate,
-            duration_s=args.duration,
-            hz=args.hz,
-            tilt_cb=ts.sample,
-        )
-        ran_controller = True
-        metrics = run_out if isinstance(run_out, dict) else {}
-except Exception as e:
-    print(f"[straight_line][WARN] SL.run() not available or failed: {e}")
-
-# Fallback controller (DC first, then raw DriveAPI)
-omega_cmd = None
-if not ran_controller:
-    wheel_r = feats.wheel_radius_m or 0.0
-    omega_cmd = (args.vx / max(1e-6, wheel_r)) if wheel_r > 0 else 0.0
-
-    # 1) DriveAPI with per-wheel sign
-    ok = 0
-    for jp in (feats.drive_joint_paths or []):
-        _set_joint_target_velocity(jp, omega_cmd)
-    if ok > 0:
-        print(f"[drive] commanded ω=±{abs(omega_cmd):.3f} rad/s via DriveAPI on {ok}/{len(feats.drive_joint_paths or [])} joints")
-    else:
-        # 2) Fallback: DC, still with per-wheel sign
-        ok_dc = _dc_drive_wheels(prim_for_ctrl, omega_cmd, _name_to_path)
-
-    steps = max(1, int(args.duration * args.hz))
-    t0 = time.perf_counter()
-    for i in range(steps):
-        ts.sample()
-        _step_rt(sim, i, t0, dt, render=not args.headless)
+metrics["elapsed_s"] = steps * dt
+metrics["controller"] = getattr(ctrl.spec, "name", "unknown")
+metrics["commanded_vx_mps"] = float(args.vx)
+# For wheeled DC, keep omega for slip calculations (optional)
+if hasattr(ctrl, "omega_cmd"):
+    metrics["commanded_omega_rad_s"] = ctrl.omega_cmd
 
 # -------------------------------
 # Post-run quick metrics (proxy + slip)
 # -------------------------------
+
 d = distance_from(stage, body_path, start_pos)
 elapsed_s = metrics.get("elapsed_s", args.duration)
 avg_v_obs = (d / max(1e-6, elapsed_s))
@@ -597,19 +458,17 @@ E = proxy_energy_J(distance_m=d, mass_kg=m_eff, mu=mu_d, g=g)
 Jpm = (E / d) if d > 1e-9 else None
 cot = cost_of_transport(E_J=E, mass_kg=m_eff, g=g, distance_m=d)
 
+slip_i = None
 wheel_r = feats.wheel_radius_m or 0.0
-omega_for_slip = None
-if omega_cmd is not None:
-    omega_for_slip = omega_cmd
-elif feats.drive_target_omega is not None:
-    omega_for_slip = feats.drive_target_omega
-
-slip_i = slip_ratio_estimate(avg_v_obs, wheel_r if wheel_r > 0 else None, omega_for_slip)
+omega_for_slip = metrics.get("commanded_omega_rad_s", None)
+if wheel_r > 0.0 and omega_for_slip is not None:
+    slip_i = slip_ratio_estimate(avg_v_obs, wheel_r, omega_for_slip)
 
 tilt_stats = ts.results()
 Jpm_str = f"{Jpm:.2f}" if Jpm is not None else "n/a"
 cot_str = f"{cot:.3f}" if cot is not None else "n/a"
-print(f"[energy][proxy] d={d:.2f} m, μd={mu_d:.2f}, m={m_eff:.2f} kg -> E≈{E:.1f} J, J/m={Jpm_str}, CoT={cot_str}")
+slip_str = f"{slip_i:.3f}" if slip_i is not None else "n/a"
+print(f"[energy][proxy] d={d:.2f} m,  avg_v={avg_v_obs:.2f} mps, μd={mu_d:.2f}, m={m_eff:.2f} kg -> E≈{E:.1f} J, J/m={Jpm_str}, CoT={cot_str}, slip_ratio={slip_str}")
 
 metrics.update({
     "elapsed_s": elapsed_s,
@@ -618,7 +477,7 @@ metrics.update({
     "energy_J": E,
     "energy_per_m_Jpm": (Jpm or 0.0),
     "cot": cot,
-    "slip_ratio_est": slip_i,
+    "slip_ratio_est": (slip_i if slip_i is not None else 0.0),
     "tilt_max_deg": tilt_stats["tilt_max_deg"],
     "tilt_rms_deg": tilt_stats["tilt_rms_deg"],
 })

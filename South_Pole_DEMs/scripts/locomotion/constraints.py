@@ -2,7 +2,8 @@
 
 from dataclasses import dataclass
 from typing import Tuple, Optional, List
-from pxr import Usd, UsdGeom, UsdPhysics, PhysxSchema, Gf, Sdf
+from pxr import Usd, UsdGeom, UsdPhysics, PhysxSchema, Gf
+from typing import List, Tuple
 
 # Config
 
@@ -12,7 +13,6 @@ class ConstraintConfig:
     robot_kg: float = 0.0                    # extra mass added to base (robot shell, sensors, etc.)
     payload_kg: float = 0.0                  # extra payload mass
     payload_offset_xyz: Tuple[float,float,float] = (0.0, 0.0, 0.0)
-    check_los: bool = False                  # TODO: path-of-sight check (stub)
     energy_model: str = "proxy"              # "proxy" | "measured" (measured = out-of-scope here)
 
 # Terrain friction
@@ -236,12 +236,6 @@ def effective_rover_mass_kg(stage: Usd.Stage, art_root: str, cfg: ConstraintConf
     """Mass used for energy proxy: authored link masses + robot_kg + payload_kg."""
     return total_articulation_mass_kg(stage, art_root) + float(cfg.robot_kg) + float(cfg.payload_kg)
 
-# LOS (stub)
-
-def los_ok(stage: Usd.Stage, src_path: str, dst_path: str) -> bool:
-    # TODO: implement a real ray cast using omni.physx query or RTX ray queries
-    return True
-
 # Pose & energy
 
 def world_translation(stage: Usd.Stage, prim_path: str) -> Optional[Gf.Vec3d]:
@@ -459,6 +453,122 @@ def cost_of_transport(E_J: float, mass_kg: float, g: float, distance_m: float) -
         return None
     return float(E_J) / (float(mass_kg) * float(g) * float(distance_m))
 
+def _convex_hull_xy(points: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
+    # Andrew’s monotone chain; returns CCW hull
+    pts = sorted(set(points))
+    if len(pts) <= 1:
+        return pts
+    def cross(o, a, b): return (a[0]-o[0])*(b[1]-o[1]) - (a[1]-o[1])*(b[0]-o[0])
+    lower = []
+    for p in pts:
+        while len(lower) >= 2 and cross(lower[-2], lower[-1], p) <= 0: lower.pop()
+        lower.append(p)
+    upper = []
+    for p in reversed(pts):
+        while len(upper) >= 2 and cross(upper[-2], upper[-1], p) <= 0: upper.pop()
+        upper.append(p)
+    return lower[:-1] + upper[:-1]
+
+def _point_in_convex_polygon(p: Tuple[float,float], hull: List[Tuple[float,float]]) -> bool:
+    if len(hull) < 3: return False
+    sign = None
+    for i in range(len(hull)):
+        a, b = hull[i], hull[(i+1) % len(hull)]
+        cross = (b[0]-a[0])*(p[1]-a[1]) - (b[1]-a[1])*(p[0]-a[0])
+        if cross == 0:  # on edge
+            continue
+        s = cross > 0
+        if sign is None: sign = s
+        elif s != sign: return False
+    return True
+
+def _point_to_segment_distance(p: Tuple[float,float], a: Tuple[float,float], b: Tuple[float,float]) -> float:
+    import math
+    px, py = p; ax, ay = a; bx, by = b
+    abx, aby = bx-ax, by-ay
+    apx, apy = px-ax, py-ay
+    ab2 = abx*abx + aby*aby
+    t = 0.0 if ab2 == 0 else max(0.0, min(1.0, (apx*abx + apy*aby) / ab2))
+    cx, cy = ax + t*abx, ay + t*aby
+    return math.hypot(px - cx, py - cy)
+
+def _point_to_polygon_distance(p: Tuple[float,float], hull: List[Tuple[float,float]]) -> float:
+    if len(hull) == 0: return float('inf')
+    if len(hull) == 1:
+        import math
+        return math.hypot(p[0]-hull[0][0], p[1]-hull[0][1])
+    if len(hull) == 2: return _point_to_segment_distance(p, hull[0], hull[1])
+    dmin = float('inf')
+    for i in range(len(hull)):
+        dmin = min(dmin, _point_to_segment_distance(p, hull[i], hull[(i+1) % len(hull)]))
+    return dmin
+
+def estimate_support_polygon_xy(stage: Usd.Stage, art_root: str) -> List[Tuple[float,float]]:
+    """
+    Collect likely ground-contact link XY under art_root: wheels or feet.
+    Fallback = base aligned-bbox footprint. Returns convex hull (CCW).
+    """
+    prim_root = stage.GetPrimAtPath(art_root)
+    pts: List[Tuple[float,float]] = []
+    if prim_root and prim_root.IsValid():
+        tcode = Usd.TimeCode.Default()
+        # wheels / feet / toes / ankles
+        for prim in stage.Traverse():
+            path = prim.GetPath().pathString
+            if not path.startswith(art_root): continue
+            n = prim.GetName().lower()
+            if any(k in n for k in ("wheel", "foot", "toe", "ankle")):
+                try:
+                    xf = UsdGeom.Xformable(prim).ComputeLocalToWorldTransform(tcode)
+                    tr = xf.ExtractTranslation()
+                    pts.append((float(tr[0]), float(tr[1])))
+                except Exception:
+                    pass
+        if len(pts) < 3:
+            try:
+                bbox = UsdGeom.BBoxCache(tcode, ["default"]).ComputeWorldBound(prim_root)
+                aabb = bbox.ComputeAlignedBox()
+                mn, mx = aabb.GetMin(), aabb.GetMax()
+                pts = [(float(mn[0]), float(mn[1])),
+                       (float(mx[0]), float(mn[1])),
+                       (float(mx[0]), float(mx[1])),
+                       (float(mn[0]), float(mx[1]))]
+            except Exception:
+                pts = []
+    return _convex_hull_xy(pts) if pts else pts
+
+def xcom_margin_metric(stage: Usd.Stage, art_root: str, avg_v_mps: float, g: float = 9.81):
+    """
+    Capture-point (Extrapolated-CoM) margin [m]:
+      margin = d_in - v/ω0, with ω0 = sqrt(g / z_com)
+      d_in = shortest distance from COM projection to support polygon edge (>=0 if inside).
+
+    Returns (margin_m, info_dict)
+    """
+    tcode = Usd.TimeCode.Default()
+    base = stage.GetPrimAtPath(art_root)
+    if not base or not base.IsValid():
+        return 0.0, {"error": "art_root prim not found"}
+
+    try:
+        xf = UsdGeom.Xformable(base).ComputeLocalToWorldTransform(tcode)
+        tr = xf.ExtractTranslation()
+        z_com = max(0.05, float(tr[2]))
+        pxy = (float(tr[0]), float(tr[1]))
+    except Exception:
+        z_com, pxy = 0.5, (0.0, 0.0)
+
+    omega0 = (g / z_com) ** 0.5
+    r = max(0.0, float(avg_v_mps)) / max(1e-6, omega0)
+
+    hull = estimate_support_polygon_xy(stage, art_root)
+    if not hull:
+        return -r, {"r_xcom": r, "z_com": z_com, "d_in": 0.0, "inside": False, "n_support": 0}
+
+    inside = _point_in_convex_polygon(pxy, hull)
+    d_in = _point_to_polygon_distance(pxy, hull)
+    margin = (d_in if inside else -d_in) - r
+    return margin, {"r_xcom": r, "z_com": z_com, "d_in": d_in, "inside": inside, "n_support": len(hull)}
 
 def slip_ratio_estimate(avg_v_mps: float, wheel_radius_m: Optional[float], omega_rad_s: Optional[float]) -> Optional[float]:
     """i = (r*ω - v) / (r*ω), clipped to [0,1]; returns None if not computable."""
@@ -501,18 +611,28 @@ def static_proxy_metrics(stage: Usd.Stage, art_root: str, cfg: ConstraintConfig,
     E_J = proxy_energy_J(distance_m=distance_m, mass_kg=m_eff, mu=mu_d, g=g) if distance_m > 0 else 0.0
     J_per_m = mu_d * m_eff * g
     cot = mu_d
-    slip_i = slip_ratio_estimate(avg_v_mps, feats.wheel_radius_m, feats.drive_target_omega)
+    # slip_i = slip_ratio_estimate(avg_v_mps, feats.wheel_radius_m, feats.drive_target_omega)
+
+    # return {
+    #     "mu_d": mu_d,
+    #     "mu_s": mu_s,
+    #     "g_mps2": g,
+    #     "mass_eff_kg": m_eff,
+    #     "features": feats,
+    #     "energy_J": E_J,
+    #     "energy_per_m_Jpm": J_per_m,
+    #     "cot": cot,
+    #     "slip_ratio_est": slip_i,
+    # }
+    xcom_m, _xinfo = xcom_margin_metric(stage, art_root, avg_v_mps, g=g)
 
     return {
-        "mu_d": mu_d,
-        "mu_s": mu_s,
-        "g_mps2": g,
-        "mass_eff_kg": m_eff,
-        "features": feats,
+        "distance_m": distance_m,
+        "avg_v_mps": avg_v_mps,
         "energy_J": E_J,
         "energy_per_m_Jpm": J_per_m,
-        "cot": cot,
-        "slip_ratio_est": slip_i,
+        "CoT": cot,
+        "xcom_margin_m": float(xcom_m),
     }
 
 # Main entry
