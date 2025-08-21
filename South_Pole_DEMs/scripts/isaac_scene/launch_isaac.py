@@ -7,7 +7,6 @@ import time
 
 from isaacsim import SimulationApp
 
-# Add project root
 _THIS = Path(__file__).resolve()
 _SCRIPT_DIR = _THIS.parent.parent
 if str(_SCRIPT_DIR) not in sys.path:
@@ -89,7 +88,8 @@ simulation_app = SimulationApp({"renderer": args.renderer, "headless": args.head
 from locomotion.constraints import (
     ConstraintConfig, apply_constraints, world_translation,
     distance_from, get_gravity_mps2, proxy_energy_J, rover_features, cost_of_transport,
-    effective_rover_mass_kg, body_upright_tilt_deg, get_terrain_friction, slip_ratio_estimate
+    effective_rover_mass_kg, body_upright_tilt_deg, get_terrain_friction,
+    xcom_margin_metric, effective_contact_mu,
 )
 
 import omni.usd
@@ -110,6 +110,9 @@ from isaacsim.core.api import SimulationContext
 from omni.kit.viewport.utility import get_active_viewport, get_active_viewport_window
 import omni.kit.commands
 from omni.isaac.dynamic_control import _dynamic_control as dc
+
+import locomotion.constraints as _constraints
+print(f"[debug] using constraints module at: {_constraints.__file__}")
 
 # -------------------------------
 # Helpers
@@ -423,6 +426,14 @@ body_path = (feats.base_link_path or prim_for_ctrl)
 start_pos = world_translation(stage, body_path)
 ts = TiltSampler(stage, body_path)
 
+prev_pos = world_translation(stage, body_path)
+track_len = 0.0
+
+# Let contacts settle before driving (improves early-time metrics)
+for _ in range(int(0.5 * args.hz)):  # 0.5 s settle
+    ts.sample()
+    sim.step(render=not args.headless)
+
 # Pick and run the appropriate controller for this robot
 ctrl = pick_controller(stage, prim_for_ctrl, feats, preferred=args.controller)
 ctrl.start(vx=args.vx, yaw_rate=args.yaw_rate, hz=args.hz)
@@ -430,6 +441,12 @@ ctrl.start(vx=args.vx, yaw_rate=args.yaw_rate, hz=args.hz)
 steps = max(1, int(args.duration * args.hz))
 t0 = time.perf_counter()
 for i in range(steps):
+    cur_pos = world_translation(stage, body_path)
+    if prev_pos is not None and cur_pos is not None:
+        # integrate arc length in 3D
+        track_len += float((cur_pos - prev_pos).GetLength())
+    prev_pos = cur_pos
+
     ts.sample()
     ctrl.step()
     _step_rt(sim, i, t0, dt, render=not args.headless)
@@ -438,46 +455,66 @@ ctrl.shutdown()
 metrics["elapsed_s"] = steps * dt
 metrics["controller"] = getattr(ctrl.spec, "name", "unknown")
 metrics["commanded_vx_mps"] = float(args.vx)
-# For wheeled DC, keep omega for slip calculations (optional)
-if hasattr(ctrl, "omega_cmd"):
-    metrics["commanded_omega_rad_s"] = ctrl.omega_cmd
 
 # -------------------------------
-# Post-run quick metrics (proxy + slip)
+# Post-run quick metrics
 # -------------------------------
 
-d = distance_from(stage, body_path, start_pos)
-elapsed_s = metrics.get("elapsed_s", args.duration)
-avg_v_obs = (d / max(1e-6, elapsed_s))
+# Distance & speed
+d_net   = distance_from(stage, body_path, start_pos)     # straight-line
+d_track = max(track_len, d_net)                          # use arc length if we have it
+elapsed_s  = metrics.get("elapsed_s", args.duration)
+avg_v_obs  = d_track / max(1e-6, elapsed_s)
 
+# Environment & contact
 g = get_gravity_mps2(stage, default_g=(1.62 if args.moon else 9.81))
 m_eff = effective_rover_mass_kg(stage, prim_for_ctrl, cfg)
 _, mu_d = get_terrain_friction(stage, "/World/Terrain")
 
-E = proxy_energy_J(distance_m=d, mass_kg=m_eff, mu=mu_d, g=g)
-Jpm = (E / d) if d > 1e-9 else None
-cot = cost_of_transport(E_J=E, mass_kg=m_eff, g=g, distance_m=d)
+# Stability (uses observed avg speed)
+xcom_m, _xinfo = xcom_margin_metric(stage, body_path, avg_v_obs, g=g)
 
-slip_i = None
+# Energy proxy (rolling/sliding-loss)
+E   = proxy_energy_J(distance_m=d_track, mass_kg=m_eff, mu=mu_d, g=g)
+Jpm = (E / max(d_track, 1e-9))
+cot = cost_of_transport(E_J=E, mass_kg=m_eff, g=g, distance_m=d_track)
+
+# Slip estimate: compare commanded tangential speed to observed avg_v
 wheel_r = feats.wheel_radius_m or 0.0
-omega_for_slip = metrics.get("commanded_omega_rad_s", None)
-if wheel_r > 0.0 and omega_for_slip is not None:
-    slip_i = slip_ratio_estimate(avg_v_obs, wheel_r, omega_for_slip)
+# prefer a controller-provided ω, else derive from the command if we know r
+omega_cmd = metrics.get("commanded_omega_rad_s", None)
+if omega_cmd is None and wheel_r > 0.0 and args.vx is not None:
+    omega_cmd = float(args.vx) / float(wheel_r)
+v_ref = (float(wheel_r) * float(omega_cmd)) if (omega_cmd is not None and wheel_r > 0.0) else float(args.vx)
+slip_ratio = None
+if d_track and d_track > 1e-6:
+    slip_ratio = max(0.0, min(1.0, 1.0 - (d_net / d_track)))
+slip_str = f"{(slip_ratio*100):.1f}%" if slip_ratio is not None else "n/a"
 
+# Tilt stats collected during run
 tilt_stats = ts.results()
-Jpm_str = f"{Jpm:.2f}" if Jpm is not None else "n/a"
-cot_str = f"{cot:.3f}" if cot is not None else "n/a"
-slip_str = f"{slip_i:.3f}" if slip_i is not None else "n/a"
-print(f"[energy][proxy] d={d:.2f} m,  avg_v={avg_v_obs:.2f} mps, μd={mu_d:.2f}, m={m_eff:.2f} kg -> E≈{E:.1f} J, J/m={Jpm_str}, CoT={cot_str}, slip_ratio={slip_str}")
+
+Jpm_str  = f"{Jpm:.2f}" if Jpm is not None else "n/a"
+cot_str  = f"{cot:.3f}" if cot is not None else "n/a"
+xcom_str = f"{xcom_m:.3f}"
+slip_str = f"{(slip_ratio*100):.1f}%" if slip_ratio is not None else "n/a"
+
+print(f"[energy][proxy] d_net={d_net:.2f} m, d_track={d_track:.2f} m,  "
+      f"avg_v={avg_v_obs:.2f} mps, μeff={mu_d:.2f}, m={m_eff:.2f} kg, g={g:.2f} -> "
+      f"E≈{E:.1f} J, J/m={Jpm:.2f}, CoT={cot:.3f}")
 
 metrics.update({
     "elapsed_s": elapsed_s,
-    "distance_m": d,
+    "distance_m": d_track,
     "avg_speed_mps": avg_v_obs,
     "energy_J": E,
-    "energy_per_m_Jpm": (Jpm or 0.0),
+    "energy_per_m_Jpm": (Jpm if Jpm is not None else 0.0),
     "cot": cot,
-    "slip_ratio_est": (slip_i if slip_i is not None else 0.0),
-    "tilt_max_deg": tilt_stats["tilt_max_deg"],
-    "tilt_rms_deg": tilt_stats["tilt_rms_deg"],
+    "xcom_margin_m": xcom_m,
+    "tilt_max_deg": tilt_stats.get("tilt_max_deg"),
+    "tilt_rms_deg": tilt_stats.get("tilt_rms_deg"),
+    "m_eff": m_eff,
+    "mass_eff_kg": m_eff,
+    "gravity_mps2": g,
+    "slip_ratio": slip_ratio,
 })

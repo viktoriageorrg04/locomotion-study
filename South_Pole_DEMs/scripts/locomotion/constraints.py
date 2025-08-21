@@ -101,6 +101,42 @@ def get_terrain_friction(stage: Usd.Stage, terrain_path: str = "/World/Terrain")
     if dyn  is None: dyn  = 0.6
     return float(stat), float(dyn)
 
+def get_wheel_friction(stage: Usd.Stage, wheel_mat_path: str = "/World/Looks/WheelMaterial"):
+    """Return (μs, μd, combine_mode_str) from the wheel material if present."""
+    prim = stage.GetPrimAtPath(wheel_mat_path)
+    if not prim or not prim.IsValid():
+        return None, None, None
+    usd_api = UsdPhysics.MaterialAPI.Get(stage, prim.GetPath()) if prim.HasAPI(UsdPhysics.MaterialAPI) else None
+    physx_api = PhysxSchema.PhysxMaterialAPI.Get(stage, prim.GetPath()) if prim.HasAPI(PhysxSchema.PhysxMaterialAPI) else None
+
+    stat, dyn = _read_mu(usd_api, physx_api)
+    combine = None
+    try:
+        if physx_api and physx_api.GetFrictionCombineModeAttr():
+            combine = physx_api.GetFrictionCombineModeAttr().Get()
+    except Exception:
+        pass
+    return (float(stat) if stat is not None else None,
+            float(dyn) if dyn is not None else None,
+            (combine or "").lower() or None)
+
+def effective_contact_mu(stage: Usd.Stage) -> float:
+    """PhysX-style effective μd using terrain and wheel material with combine mode."""
+    _, terr_mu_d = get_terrain_friction(stage, "/World/Terrain")
+    w_mu_s, w_mu_d, combine = get_wheel_friction(stage)
+    if w_mu_d is None:
+        return float(terr_mu_d)
+    combine = (combine or "min").lower()
+    if combine == "multiply":
+        return float(terr_mu_d) * float(w_mu_d)
+    if combine in ("min",):
+        return min(float(terr_mu_d), float(w_mu_d))
+    if combine in ("max",):
+        return max(float(terr_mu_d), float(w_mu_d))
+    if combine in ("average", "avg", "mean"):
+        return 0.5 * (float(terr_mu_d) + float(w_mu_d))
+    # Fallback: conservative
+    return min(float(terr_mu_d), float(w_mu_d))
 
 def scale_terrain_friction(stage: Usd.Stage, scale: float, terrain_path: str = "/World/Terrain") -> bool:
     if abs(scale - 1.0) < 1e-6:
@@ -259,21 +295,31 @@ def distance_from(stage: Usd.Stage, prim_path: str, start_pos: Optional[Gf.Vec3d
     return float((end - start_pos).GetLength())
 
 
-def get_gravity_mps2(stage: Usd.Stage, default_g: float = 9.81) -> float:
-    """Read gravity magnitude from the first UsdPhysics.Scene found, else fallback."""
+def get_gravity_mps2(stage, default_g: float = 9.81) -> float:
+    """Return gravity magnitude (m/s^2) from the stage. Falls back to default_g."""
     try:
-        for p in Usd.PrimRange(stage.GetPseudoRoot()):
-            if p.IsA(UsdPhysics.Scene):
-                sc = UsdPhysics.Scene(p)
-                mag = None
-                try:
-                    mag = sc.GetGravityMagnitudeAttr().Get()
-                except Exception:
-                    mag = None
-                if mag is not None and float(mag) > 0:
-                    return float(mag)
+        from pxr import UsdPhysics, PhysxSchema, Gf
+
+        # Try USD Physics scene first
+        ps = UsdPhysics.Scene.Get(stage, "/World/physicsScene")
+        if ps:
+            mag_attr = ps.GetGravityMagnitudeAttr()
+            if mag_attr and mag_attr.HasAuthoredValue():
+                mag = mag_attr.Get()
+                if mag is not None:
+                    return abs(float(mag))
+
+        # Fall back to PhysX schema (vector gravity)
+        prim = stage.GetPrimAtPath("/World/physicsScene")
+        if prim:
+            api = PhysxSchema.PhysxSceneAPI(prim)
+            if api:
+                g_vec = api.GetGravityAttr().Get()
+                if g_vec is not None:
+                    return float(Gf.Vec3f(g_vec).GetLength())
     except Exception:
         pass
+
     return float(default_g)
 
 
@@ -570,16 +616,6 @@ def xcom_margin_metric(stage: Usd.Stage, art_root: str, avg_v_mps: float, g: flo
     margin = (d_in if inside else -d_in) - r
     return margin, {"r_xcom": r, "z_com": z_com, "d_in": d_in, "inside": inside, "n_support": len(hull)}
 
-def slip_ratio_estimate(avg_v_mps: float, wheel_radius_m: Optional[float], omega_rad_s: Optional[float]) -> Optional[float]:
-    """i = (r*ω - v) / (r*ω), clipped to [0,1]; returns None if not computable."""
-    if wheel_radius_m is None or omega_rad_s is None or wheel_radius_m <= 0:
-        return None
-    ideal = wheel_radius_m * omega_rad_s
-    if ideal <= 1e-6:
-        return None
-    return max(0.0, min(1.0, (ideal - max(0.0, avg_v_mps)) / ideal))
-
-
 def body_upright_tilt_deg(stage: Usd.Stage, prim_path: str) -> Optional[float]:
     """Angle between body +Z and world +Z, in degrees (0 = upright)."""
     prim = stage.GetPrimAtPath(prim_path)
@@ -611,19 +647,6 @@ def static_proxy_metrics(stage: Usd.Stage, art_root: str, cfg: ConstraintConfig,
     E_J = proxy_energy_J(distance_m=distance_m, mass_kg=m_eff, mu=mu_d, g=g) if distance_m > 0 else 0.0
     J_per_m = mu_d * m_eff * g
     cot = mu_d
-    # slip_i = slip_ratio_estimate(avg_v_mps, feats.wheel_radius_m, feats.drive_target_omega)
-
-    # return {
-    #     "mu_d": mu_d,
-    #     "mu_s": mu_s,
-    #     "g_mps2": g,
-    #     "mass_eff_kg": m_eff,
-    #     "features": feats,
-    #     "energy_J": E_J,
-    #     "energy_per_m_Jpm": J_per_m,
-    #     "cot": cot,
-    #     "slip_ratio_est": slip_i,
-    # }
     xcom_m, _xinfo = xcom_margin_metric(stage, art_root, avg_v_mps, g=g)
 
     return {
