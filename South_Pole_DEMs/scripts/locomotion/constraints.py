@@ -294,22 +294,12 @@ def distance_from(stage: Usd.Stage, prim_path: str, start_pos: Optional[Gf.Vec3d
         return 0.0
     return float((end - start_pos).GetLength())
 
-
 def get_gravity_mps2(stage, default_g: float = 9.81) -> float:
     """Return gravity magnitude (m/s^2) from the stage. Falls back to default_g."""
     try:
         from pxr import UsdPhysics, PhysxSchema, Gf
 
-        # Try USD Physics scene first
-        ps = UsdPhysics.Scene.Get(stage, "/World/physicsScene")
-        if ps:
-            mag_attr = ps.GetGravityMagnitudeAttr()
-            if mag_attr and mag_attr.HasAuthoredValue():
-                mag = mag_attr.Get()
-                if mag is not None:
-                    return abs(float(mag))
-
-        # Fall back to PhysX schema (vector gravity)
+        # Try PhysX gravity vector first (most reliable during runtime)
         prim = stage.GetPrimAtPath("/World/physicsScene")
         if prim:
             api = PhysxSchema.PhysxSceneAPI(prim)
@@ -317,11 +307,18 @@ def get_gravity_mps2(stage, default_g: float = 9.81) -> float:
                 g_vec = api.GetGravityAttr().Get()
                 if g_vec is not None:
                     return float(Gf.Vec3f(g_vec).GetLength())
+
+        # Fallback: USD Physics gravity magnitude attribute
+        ps = UsdPhysics.Scene.Get(stage, "/World/physicsScene")
+        if ps:
+            mag_attr = ps.GetGravityMagnitudeAttr()
+            if mag_attr and mag_attr.HasAuthoredValue():
+                mag = mag_attr.Get()
+                if mag is not None:
+                    return abs(float(mag))
     except Exception:
         pass
-
     return float(default_g)
-
 
 def proxy_energy_J(distance_m: float, mass_kg: float, mu: float, g: float) -> float:
     """Rolling/sliding-loss proxy: E ≈ μ * m * g * d"""

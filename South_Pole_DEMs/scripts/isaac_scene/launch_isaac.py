@@ -468,6 +468,10 @@ avg_v_obs  = d_track / max(1e-6, elapsed_s)
 
 # Environment & contact
 g = get_gravity_mps2(stage, default_g=(1.62 if args.moon else 9.81))
+if args.moon and abs(g - 1.62) > 0.05:
+    print(f"[warn] Stage reports g≈{g:.2f} but --moon set; overriding metrics to 1.62.")
+    g = 1.62
+
 m_eff = effective_rover_mass_kg(stage, prim_for_ctrl, cfg)
 _, mu_d = get_terrain_friction(stage, "/World/Terrain")
 
@@ -501,7 +505,7 @@ slip_str = f"{(slip_ratio*100):.1f}%" if slip_ratio is not None else "n/a"
 
 print(f"[energy][proxy] d_net={d_net:.2f} m, d_track={d_track:.2f} m,  "
       f"avg_v={avg_v_obs:.2f} mps, μeff={mu_d:.2f}, m={m_eff:.2f} kg, g={g:.2f} -> "
-      f"E≈{E:.1f} J, J/m={Jpm:.2f}, CoT={cot:.3f}")
+      f"E≈{E:.1f} J, J/m={Jpm:.2f}, CoT={cot:.3f}, xCOM={xcom_str} m, slip={slip_str}")
 
 metrics.update({
     "elapsed_s": elapsed_s,
