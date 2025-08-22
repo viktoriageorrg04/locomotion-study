@@ -89,7 +89,7 @@ from locomotion.constraints import (
     ConstraintConfig, apply_constraints, world_translation,
     distance_from, get_gravity_mps2, proxy_energy_J, rover_features, cost_of_transport,
     effective_rover_mass_kg, body_upright_tilt_deg, get_terrain_friction,
-    xcom_margin_metric, effective_contact_mu,
+    xcom_margin_metric, effective_contact_mu, TiltSampler, ForwardSpeedSampler, slip_metrics,
 )
 
 import omni.usd
@@ -139,36 +139,11 @@ def _step_rt(sim, step_idx: int, t0: float, dt: float, render: bool):
             time.sleep(min(remaining, 0.002))
 
 # -------------------------------
-# Extract rover features, friction, gravity, and effective mass
-# -------------------------------
-
-class TiltSampler:
-    """Collect max & RMS tilt (upright deviation) while sim runs."""
-    def __init__(self, stage, body_prim):
-        self.stage = stage
-        self.body  = body_prim
-        self.max_deg = 0.0
-        self.sum_sq  = 0.0
-        self.n       = 0
-
-    def sample(self):
-        t = body_upright_tilt_deg(self.stage, self.body)
-        if t is None: return
-        if t > self.max_deg: self.max_deg = t
-        self.sum_sq += t*t
-        self.n += 1
-
-    def results(self):
-        rms = (self.sum_sq / self.n) ** 0.5 if self.n > 0 else None
-        return {"tilt_max_deg": self.max_deg, "tilt_rms_deg": rms}
-
-# -------------------------------
 # Frame camera on terrain (best-effort; version-safe)
 # -------------------------------
 
 def _get_active_viewport():
     """Return a viewport API object (not the window) across Kit versions."""
-    # Preferred: grab the active viewport window then take .viewport_api
     try:
         win = get_active_viewport_window()
         if win and hasattr(win, "viewport_api"):
@@ -425,6 +400,7 @@ metrics = {}
 body_path = (feats.base_link_path or prim_for_ctrl)
 start_pos = world_translation(stage, body_path)
 ts = TiltSampler(stage, body_path)
+fs = ForwardSpeedSampler(stage, body_path, dt)
 
 prev_pos = world_translation(stage, body_path)
 track_len = 0.0
@@ -432,6 +408,7 @@ track_len = 0.0
 # Let contacts settle before driving (improves early-time metrics)
 for _ in range(int(0.5 * args.hz)):  # 0.5 s settle
     ts.sample()
+    fs.sample()
     sim.step(render=not args.headless)
 
 # Pick and run the appropriate controller for this robot
@@ -448,6 +425,7 @@ for i in range(steps):
     prev_pos = cur_pos
 
     ts.sample()
+    fs.sample()
     ctrl.step()
     _step_rt(sim, i, t0, dt, render=not args.headless)
 ctrl.shutdown()
@@ -465,6 +443,7 @@ d_net   = distance_from(stage, body_path, start_pos)     # straight-line
 d_track = max(track_len, d_net)                          # use arc length if we have it
 elapsed_s  = metrics.get("elapsed_s", args.duration)
 avg_v_obs  = d_track / max(1e-6, elapsed_s)
+v_forward = fs.results()["v_forward_avg_mps"]
 
 # Environment & contact
 g = get_gravity_mps2(stage, default_g=(1.62 if args.moon else 9.81))
@@ -473,39 +452,42 @@ if args.moon and abs(g - 1.62) > 0.05:
     g = 1.62
 
 m_eff = effective_rover_mass_kg(stage, prim_for_ctrl, cfg)
-_, mu_d = get_terrain_friction(stage, "/World/Terrain")
+mu_eff = effective_contact_mu(stage)
 
-# Stability (uses observed avg speed)
-xcom_m, _xinfo = xcom_margin_metric(stage, body_path, avg_v_obs, g=g)
+# Stability (uses forward speed for capture point)
+xcom_m, _xinfo = xcom_margin_metric(stage, body_path, v_forward, g=g)
 
 # Energy proxy (rolling/sliding-loss)
-E   = proxy_energy_J(distance_m=d_track, mass_kg=m_eff, mu=mu_d, g=g)
+E   = proxy_energy_J(distance_m=d_track, mass_kg=m_eff, mu=mu_eff, g=g)
 Jpm = (E / max(d_track, 1e-9))
 cot = cost_of_transport(E_J=E, mass_kg=m_eff, g=g, distance_m=d_track)
 
-# Slip estimate: compare commanded tangential speed to observed avg_v
+# Slip estimate
 wheel_r = feats.wheel_radius_m or 0.0
-# prefer a controller-provided ω, else derive from the command if we know r
-omega_cmd = metrics.get("commanded_omega_rad_s", None)
-if omega_cmd is None and wheel_r > 0.0 and args.vx is not None:
-    omega_cmd = float(args.vx) / float(wheel_r)
-v_ref = (float(wheel_r) * float(omega_cmd)) if (omega_cmd is not None and wheel_r > 0.0) else float(args.vx)
-slip_ratio = None
+omega_ref = metrics.get("commanded_omega_rad_s", None)
+if omega_ref is None and wheel_r > 0.0 and feats.drive_target_omega:
+    omega_ref = float(feats.drive_target_omega)
+if omega_ref is None and wheel_r > 0.0 and args.vx is not None:
+    omega_ref = float(args.vx) / float(wheel_r)
+slip_long, v_ref = slip_metrics(v_forward, args.vx, wheel_r, omega_ref)
+
+# arc-vs-net slip (existing)
+slip_arc = None
 if d_track and d_track > 1e-6:
-    slip_ratio = max(0.0, min(1.0, 1.0 - (d_net / d_track)))
-slip_str = f"{(slip_ratio*100):.1f}%" if slip_ratio is not None else "n/a"
+    slip_arc = max(0.0, min(1.0, 1.0 - (d_net / d_track)))
 
 # Tilt stats collected during run
 tilt_stats = ts.results()
 
-Jpm_str  = f"{Jpm:.2f}" if Jpm is not None else "n/a"
-cot_str  = f"{cot:.3f}" if cot is not None else "n/a"
-xcom_str = f"{xcom_m:.3f}"
-slip_str = f"{(slip_ratio*100):.1f}%" if slip_ratio is not None else "n/a"
+Jpm_str    = f"{Jpm:.2f}" if Jpm is not None else "n/a"
+cot_str    = f"{cot:.3f}" if cot is not None else "n/a"
+xcom_str   = f"{xcom_m:.3f}"
+sl_longstr = f"{(slip_long*100):.1f}%" if slip_long is not None else "n/a"
+sl_arcstr  = f"{(slip_arc*100):.1f}%" if slip_arc is not None else "n/a"
 
 print(f"[energy][proxy] d_net={d_net:.2f} m, d_track={d_track:.2f} m,  "
-      f"avg_v={avg_v_obs:.2f} mps, μeff={mu_d:.2f}, m={m_eff:.2f} kg, g={g:.2f} -> "
-      f"E≈{E:.1f} J, J/m={Jpm:.2f}, CoT={cot:.3f}, xCOM={xcom_str} m, slip={slip_str}")
+      f"avg_v={avg_v_obs:.2f} mps, v_fwd={v_forward:.2f} mps, μeff={mu_eff:.2f}, m={m_eff:.2f} kg, g={g:.2f} -> "
+      f"E≈{E:.1f} J, J/m={Jpm:.2f}, CoT={cot:.3f}, xCOM={xcom_str} m, slip_long={sl_longstr}, slip_arc={sl_arcstr}")
 
 metrics.update({
     "elapsed_s": elapsed_s,
@@ -515,10 +497,12 @@ metrics.update({
     "energy_per_m_Jpm": (Jpm if Jpm is not None else 0.0),
     "cot": cot,
     "xcom_margin_m": xcom_m,
+    "v_forward_avg_mps": v_forward,
     "tilt_max_deg": tilt_stats.get("tilt_max_deg"),
     "tilt_rms_deg": tilt_stats.get("tilt_rms_deg"),
     "m_eff": m_eff,
     "mass_eff_kg": m_eff,
     "gravity_mps2": g,
-    "slip_ratio": slip_ratio,
+    "slip_longitudinal": slip_long,
+    "slip_arc_vs_net": slip_arc,
 })

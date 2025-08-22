@@ -3,7 +3,6 @@
 from dataclasses import dataclass
 from typing import Tuple, Optional, List
 from pxr import Usd, UsdGeom, UsdPhysics, PhysxSchema, Gf
-from typing import List, Tuple
 
 # Config
 
@@ -496,6 +495,74 @@ def cost_of_transport(E_J: float, mass_kg: float, g: float, distance_m: float) -
         return None
     return float(E_J) / (float(mass_kg) * float(g) * float(distance_m))
 
+class TiltSampler:
+    """Collect max & RMS tilt (upright deviation) while sim runs."""
+    def __init__(self, stage, body_prim: str):
+        self.stage = stage
+        self.body  = body_prim
+        self.max_deg = 0.0
+        self.sum_sq  = 0.0
+        self.n       = 0
+
+    def sample(self):
+        t = body_upright_tilt_deg(self.stage, self.body)
+        if t is None:
+            return
+        if t > self.max_deg:
+            self.max_deg = t
+        self.sum_sq += t * t
+        self.n += 1
+
+    def results(self):
+        rms = (self.sum_sq / self.n) ** 0.5 if self.n > 0 else None
+        return {"tilt_max_deg": self.max_deg, "tilt_rms_deg": rms}
+
+
+class ForwardSpeedSampler:
+    """Estimate forward speed by projecting world velocity onto the body +X axis."""
+    def __init__(self, stage, body_path: str, dt: float):
+        self.stage = stage
+        self.body_path = body_path
+        self.dt = dt
+        self.prev_pos = world_translation(stage, body_path)
+        self.sum = 0.0
+        self.n = 0
+
+    def sample(self):
+        cur_pos = world_translation(self.stage, self.body_path)
+        if self.prev_pos is None or cur_pos is None:
+            self.prev_pos = cur_pos
+            return
+        try:
+            xf = UsdGeom.Xformable(self.stage.GetPrimAtPath(self.body_path)).ComputeLocalToWorldTransform(Usd.TimeCode.Default())
+            fwd = xf.TransformDir(Gf.Vec3d(1.0, 0.0, 0.0)).GetNormalized()
+        except Exception:
+            fwd = Gf.Vec3d(1.0, 0.0, 0.0)
+        v_vec = (cur_pos - self.prev_pos) * (1.0 / max(self.dt, 1e-6))
+        from pxr import Gf as _Gf
+        v_fwd = float(_Gf.Dot(v_vec, fwd))
+        self.sum += v_fwd
+        self.n += 1
+        self.prev_pos = cur_pos
+
+    def results(self):
+        return {"v_forward_avg_mps": (self.sum / self.n) if self.n > 0 else 0.0}
+
+def slip_metrics(v_forward_mps: float, vx_cmd_mps: float, wheel_r_m: float, omega_target_rad_s: Optional[float] = None):
+    """
+    Return (slip_long_0to1_or_None, v_ref_mps).
+    v_ref = r*omega_target (if provided) else commanded vx.
+    """
+    v_ref = None
+    if wheel_r_m and omega_target_rad_s is not None:
+        v_ref = float(wheel_r_m) * float(omega_target_rad_s)
+    elif vx_cmd_mps is not None:
+        v_ref = float(vx_cmd_mps)
+    if v_ref is None or abs(v_ref) < 1e-6:
+        return None, v_ref
+    slip_long = max(0.0, min(1.0, (v_ref - float(v_forward_mps)) / max(abs(v_ref), 1e-6)))
+    return slip_long, v_ref
+
 def _convex_hull_xy(points: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
     # Andrew’s monotone chain; returns CCW hull
     pts = sorted(set(points))
@@ -580,29 +647,54 @@ def estimate_support_polygon_xy(stage: Usd.Stage, art_root: str) -> List[Tuple[f
                 pts = []
     return _convex_hull_xy(pts) if pts else pts
 
-def xcom_margin_metric(stage: Usd.Stage, art_root: str, avg_v_mps: float, g: float = 9.81):
+def world_center_of_mass(stage: Usd.Stage, art_root: str) -> Tuple[Optional[Gf.Vec3d], float]:
+    """
+    Mass-weighted world CoM (x,y,z) using authored UsdPhysics.MassAPI.mass on links.
+    Falls back to the articulation root transform if masses are missing.
+    """
+    root = stage.GetPrimAtPath(art_root)
+    if not root or not root.IsValid():
+        return None, 0.0
+    tcode = Usd.TimeCode.Default()
+    m_sum = 0.0
+    p_sum = Gf.Vec3d(0.0, 0.0, 0.0)
+    for p in Usd.PrimRange(root):
+        try:
+            if p.HasAPI(UsdPhysics.MassAPI):
+                m = UsdPhysics.MassAPI(p).GetMassAttr().Get()
+                if m is None or m <= 0:
+                    continue
+                xf = UsdGeom.Xformable(p).ComputeLocalToWorldTransform(tcode)
+                tr = xf.ExtractTranslation()
+                p_sum += Gf.Vec3d(tr) * float(m)
+                m_sum += float(m)
+        except Exception:
+            pass
+    if m_sum > 0.0:
+        return (p_sum / m_sum), m_sum
+    # Fallback: use articulation root pose
+    try:
+        xf = UsdGeom.Xformable(root).ComputeLocalToWorldTransform(tcode)
+        return Gf.Vec3d(xf.ExtractTranslation()), 0.0
+    except Exception:
+        return None, 0.0
+
+def xcom_margin_metric(stage: Usd.Stage, art_root: str, v_mps: float, g: float = 9.81):
     """
     Capture-point (Extrapolated-CoM) margin [m]:
-      margin = d_in - v/ω0, with ω0 = sqrt(g / z_com)
-      d_in = shortest distance from COM projection to support polygon edge (>=0 if inside).
-
-    Returns (margin_m, info_dict)
+      margin = d_in − v/ω0, with ω0 = sqrt(g / z_com)
+      d_in = shortest distance from CoM projection to support polygon edge (>=0 if inside).
+    Uses mass-weighted world CoM for z_com and (x,y).
+    Returns (margin_m, info_dict).
     """
-    tcode = Usd.TimeCode.Default()
-    base = stage.GetPrimAtPath(art_root)
-    if not base or not base.IsValid():
-        return 0.0, {"error": "art_root prim not found"}
-
-    try:
-        xf = UsdGeom.Xformable(base).ComputeLocalToWorldTransform(tcode)
-        tr = xf.ExtractTranslation()
-        z_com = max(0.05, float(tr[2]))
-        pxy = (float(tr[0]), float(tr[1]))
-    except Exception:
-        z_com, pxy = 0.5, (0.0, 0.0)
+    com, _m = world_center_of_mass(stage, art_root)
+    if com is None:
+        return 0.0, {"error": "CoM not available"}
+    z_com = max(0.05, float(com[2]))
+    pxy = (float(com[0]), float(com[1]))
 
     omega0 = (g / z_com) ** 0.5
-    r = max(0.0, float(avg_v_mps)) / max(1e-6, omega0)
+    r = max(0.0, float(v_mps)) / max(1e-6, omega0)
 
     hull = estimate_support_polygon_xy(stage, art_root)
     if not hull:
