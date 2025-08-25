@@ -15,3 +15,6 @@ South_Pole_DEMs/assets/
 South_Pole_DEMs/dem_processed/
 South_Pole_DEMs/usd_patches/
 blender/
+env_isaacsim/
+utils/
+scripts/

@@ -647,6 +647,46 @@ def estimate_support_polygon_xy(stage: Usd.Stage, art_root: str) -> List[Tuple[f
                 pts = []
     return _convex_hull_xy(pts) if pts else pts
 
+def estimate_support_plane_height(stage: Usd.Stage, art_root: str, wheel_radius_hint: Optional[float] = None) -> float:
+    """Approximate ground/support z under the robot from wheels/feet."""
+    tcode = Usd.TimeCode.Default()
+    zs = []
+    root = stage.GetPrimAtPath(art_root)
+    if root and root.IsValid():
+        for prim in Usd.PrimRange(root):
+            n = prim.GetName().lower()
+            if any(k in n for k in ("wheel", "foot", "toe", "ankle")):
+                try:
+                    xf = UsdGeom.Xformable(prim).ComputeLocalToWorldTransform(tcode)
+                    z = float(xf.ExtractTranslation()[2])
+                    # wheel contact is hub_z - radius
+                    rad = None
+                    try:
+                        cyl = UsdGeom.Cylinder(prim)
+                        if cyl: rad = cyl.GetRadiusAttr().Get()
+                    except Exception:
+                        pass
+                    if rad is None:
+                        rad = _prim_local_extent_radius(prim)
+                    if rad is None and wheel_radius_hint is not None:
+                        rad = wheel_radius_hint
+                    if "wheel" in n and rad is not None:
+                        z -= float(rad)
+                    zs.append(z)
+                except Exception:
+                    pass
+    if zs:
+        zs.sort()
+        return zs[len(zs)//2]  # median for robustness
+
+    # Fallback: terrain AABB min z
+    try:
+        terr = stage.GetPrimAtPath("/World/Terrain")
+        bbox = UsdGeom.BBoxCache(tcode, ["default"]).ComputeWorldBound(terr)
+        return float(bbox.ComputeAlignedBox().GetMin()[2])
+    except Exception:
+        return 0.0
+
 def world_center_of_mass(stage: Usd.Stage, art_root: str) -> Tuple[Optional[Gf.Vec3d], float]:
     """
     Mass-weighted world CoM (x,y,z) using authored UsdPhysics.MassAPI.mass on links.
@@ -682,28 +722,35 @@ def world_center_of_mass(stage: Usd.Stage, art_root: str) -> Tuple[Optional[Gf.V
 def xcom_margin_metric(stage: Usd.Stage, art_root: str, v_mps: float, g: float = 9.81):
     """
     Capture-point (Extrapolated-CoM) margin [m]:
-      margin = d_in − v/ω0, with ω0 = sqrt(g / z_com)
-      d_in = shortest distance from CoM projection to support polygon edge (>=0 if inside).
-    Uses mass-weighted world CoM for z_com and (x,y).
-    Returns (margin_m, info_dict).
+      margin = d_in − v/ω0, with ω0 = sqrt(g / z_com_rel)
+      z_com_rel = CoM height above support plane (not world Z).
     """
     com, _m = world_center_of_mass(stage, art_root)
     if com is None:
         return 0.0, {"error": "CoM not available"}
-    z_com = max(0.05, float(com[2]))
-    pxy = (float(com[0]), float(com[1]))
 
-    omega0 = (g / z_com) ** 0.5
+    # NEW: height above support plane
+    z_support = estimate_support_plane_height(stage, art_root)
+    feats = rover_features(stage, art_root)
+    z_support = estimate_support_plane_height(
+        stage, art_root, wheel_radius_hint=feats.wheel_radius_m)
+
+    z_rel = max(0.05, float(com[2]) - float(z_support))
+    omega0 = (g / z_rel) ** 0.5
     r = max(0.0, float(v_mps)) / max(1e-6, omega0)
 
     hull = estimate_support_polygon_xy(stage, art_root)
     if not hull:
-        return -r, {"r_xcom": r, "z_com": z_com, "d_in": 0.0, "inside": False, "n_support": 0}
+        return -r, {"r_xcom": r, "z_com_world": float(com[2]), "z_support": z_support,
+                    "z_com_rel": z_rel, "d_in": 0.0, "inside": False, "n_support": 0}
 
+    pxy = (float(com[0]), float(com[1]))
     inside = _point_in_convex_polygon(pxy, hull)
     d_in = _point_to_polygon_distance(pxy, hull)
     margin = (d_in if inside else -d_in) - r
-    return margin, {"r_xcom": r, "z_com": z_com, "d_in": d_in, "inside": inside, "n_support": len(hull)}
+
+    return margin, {"r_xcom": r, "z_com_world": float(com[2]), "z_support": z_support,
+                    "z_com_rel": z_rel, "d_in": d_in, "inside": inside, "n_support": len(hull)}
 
 def body_upright_tilt_deg(stage: Usd.Stage, prim_path: str) -> Optional[float]:
     """Angle between body +Z and world +Z, in degrees (0 = upright)."""
